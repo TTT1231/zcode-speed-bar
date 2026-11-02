@@ -1,0 +1,10 @@
+# Machine-local runtime state and asar backups — never commit.
+# These live in ~/.zcode/zcode-speed; the names are ignored here as a safety net.
+__pycache__/
+*.py[cod]
+backups/
+debug.log
+status.json
+install-status.json
+pending-install.json
+*.zspeed.pending

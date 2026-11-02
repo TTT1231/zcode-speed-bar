@@ -1,0 +1,9 @@
+{
+  "3.17.1": {
+    "asset": "out/renderer/assets/styles-C9n_FfEX.js",
+    "assetSha256": "256d47bf5db876d1833adee53e439c15dd3193c51118c37d33cf8a937472c51b",
+    "main": "out/main/index.js",
+    "mainSha256": "cdd9ad5c7a228c6641cabc240ad66f358a2d57b1d8016edecaa0170318d0c47c",
+    "registry": "np"
+  }
+}
