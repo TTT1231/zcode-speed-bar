@@ -1,92 +1,70 @@
 # zcode-speed-bar
 
-给 ZCode 桌面版注入一个「生成速度悬浮条」：对话窗口底部实时显示 `⚡ xx t/s` 胶囊。
-只读本地 SQLite，零网络、零凭据。非官方工具，带指纹校验与字节级备份。
+给 Windows 版 ZCode 添加生成速度悬浮条，在对话窗口底部显示 `⚡ 42.3 t/s`，每 0.5 秒刷新。
 
-Unofficial speed bar (tokens per second) for the ZCode desktop app. Windows only.
+工具在 ZCode 进程内读取实时会话状态，不发起网络请求、不读取账号凭据，也不导出消息正文。安装会修改 ZCode 的 `resources/app.asar`，属于非官方改动。
 
-## 效果
+## 数值怎么看
 
-对话窗口底部出现一个胶囊：`⚡ 42.3 t/s`（无数据时显示 `—`）。数据来自 ZCode 本地
-`~/.zcode/cli/db/db.sqlite`，通过 `fs.watch` 增量读取，只取数字摘要，不碰消息文本。
+- **生成中**：根据最近约 2 秒的输出字符增量估算 token/s，包含回答、思考和工具输入；不统计用户输入或工具返回内容。
+- **一轮结束后**：若 ZCode 提供有效的输出 token 数和模型耗时，显示该轮平均速度；否则可能保留最近的估算值。
+- **显示 `—`**：正在建立采样基线，或当前没有可用数据。生成暂停时速度会降至 `0.0`；等待前台工具且没有并行模型输出时也显示 `0.0`。
 
-## 工作原理
-
-对 ZCode 安装目录里的 `resources/app.asar` 做两处注入：
-
-1. **renderer 主 bundle 尾部**追加 `speed-bridge.js`（带 `zspeed-bridge:v1` 标记），桥接内部 store，只传出数字摘要；
-2. **`out/main/index.js` 尾部**追加一行 loader，运行时 `import` 运行目录里的 `inject-main.cjs`（悬浮条本体）。
-
-安全措施：只接受指纹校验通过的官方字节；写入走临时文件 + 逐文件校验 + 原子替换；
-ZCode 占用 asar 时自动转为 pending，等它退出后由后台进程完成；每次改动前把原始字节
-备份到 `~/.zcode/zcode-speed/backups/`，卸载时与官方指纹逐字节比对还原。
-
-## 环境要求
-
-- Windows + ZCode 桌面版（其他平台需手动 `--asar`，未测试）
-- Python 3.8+（仅标准库）
-- Node.js（注入前的语法检查用）
+各会话独立采样，切换会话时显示所选会话的速度。生成中的估算值不等同于模型服务端的精确测速。
 
 ## 安装
 
-```bash
+准备 Windows 版 ZCode、Python 3.8+ 和可在命令行调用的 Node.js。Python 只使用标准库，Node.js 用于安装时的语法检查，无需安装项目依赖。当前登记的 ZCode 版本是 **3.17.1**，以 [targets.json](targets.json) 为准。
+
+在 PowerShell 中执行：
+
+```powershell
 git clone https://github.com/TTT1231/zcode-speed-bar.git
 cd zcode-speed-bar
 python repair-speed.py install
 ```
 
-`app.asar` 自动探测（注册表卸载信息 + 常见安装路径）；探测失败时手动指定：
+`python` 不可用时可换成 `py -3`。工具会通过 Windows 注册表和常见路径寻找安装目录；自动定位失败或存在多份安装时，指定实际路径：
 
-```bash
+```powershell
 python repair-speed.py install --asar "D:\soft\ZCode\resources\app.asar"
 ```
 
-ZCode 正在运行时 asar 被占用属于正常情况：工具会写入待替换文件并留后台进程等待，
-完全退出 ZCode（托盘也要退）后自动完成，再启动 ZCode 即可。
+完成后完全退出 ZCode（包括托盘）再打开。若输出 `pending-until-ZCode-exits`，表示替换正在等待文件解锁：先退出 ZCode，等后台替换完成后再启动，不要重复安装。查看 [pending 处理](docs/maintenance.md#诊断与-pending)。
 
-验证：`~/.zcode/zcode-speed/status.json` 中 `"bridge": true`，且对话窗口底部出现 ⚡ 胶囊。
+打开一个会话，应能看到悬浮条。检查安装文件：
 
-## 更新
-
-```bash
-git pull
-python repair-speed.py install   # 重新部署并注入，然后重启 ZCode
+```powershell
+python repair-speed.py check
 ```
 
-细节：只改 `inject-main.cjs`（悬浮条本体）时，`deploy` + 重启 ZCode 就生效，不必重碰
-asar；改了 `speed-bridge.js`（烧进 asar 的渲染桥）必须重跑 `install`。拿不准就 `install`。
+正常结果为 `bridge: true`、`loader: true`、`pending: false`，退出码为 `0`。自定义安装路径时，检查和卸载也使用同一个 `--asar`。若提示版本未登记，见 [新版本适配](docs/maintenance.md#新版本适配)。
+
+## 更新与修复
+
+在源码仓库目录执行：
+
+```powershell
+git pull
+python repair-speed.py install
+```
+
+完全退出并重开 ZCode。官方升级若覆盖了注入，也按此流程恢复；新版本须先在 `targets.json` 登记并验证。悬浮条不出现、持续显示 `—` 或安装报错时，按 [维护文档](docs/maintenance.md#诊断与-pending) 排查。
 
 ## 卸载
 
-```bash
-python repair-speed.py remove    # 剥离注入并还原官方字节
+从源码仓库执行：
+
+```powershell
+python repair-speed.py remove
 ```
 
-完全退出并重开 ZCode 确认悬浮条消失。`~/.zcode/zcode-speed/` 目录可留可删，删除即彻底清除。
+等待替换完成，再完全退出并重开 ZCode，确认悬浮条消失。正常卸载会移除注入并清理 `~/.zcode/zcode-speed/` 中的运行副本、状态和备份；不要提前删除这个目录。
 
-## 新版 ZCode 适配
+未登记版本通过 `--force` 剥离桥接时会保留备份；从运行目录执行脚本或文件清理失败时，也可能留下文件。处理方法及还原范围见 [卸载与备份](docs/maintenance.md#卸载与备份)。
 
-官方升级会全量覆盖安装目录，注入被抹掉，悬浮条消失——重跑 `install` 即恢复。
-若 `check` 报 `has no verified speed bridge`，说明当前 ZCode 版本还没登记：
+## 进一步阅读
 
-1. `python repair-speed.py check` 确认报未知版本；
-2. 从 bundle 特征串找到持有 store registry 的压缩变量名（`add-version` 输出的
-   `featureContext` 提供上下文片段；也可参考同类项目 zcode-token-usage-statusbar 的适配记录）；
-3. 登记：`python repair-speed.py add-version --registry <变量名>`（特征串缺失会被拒绝——
-   store 形状变了，需先改 `speed-bridge.js` 并过 `node --test speed.test.cjs`）；
-4. `install` → 重启 ZCode → 验证；
-5. 把 `targets.json` 的变更 commit 并 push，其他机器 `git pull` 后直接 `install`。
-
-## 目录模型
-
-- **本仓库** = 源码唯一真相：`repair-speed.py`（asar 工具）、`inject-main.cjs`（悬浮条）、
-  `speed-bridge.js`（渲染桥）、`targets.json`（版本注册表）、`speed.test.cjs`（测试）。
-- **`~/.zcode/zcode-speed/`** = 机器本地运行目录：部署副本 + 全部状态
-  （`status.json`、`install-status.json`、`debug.log`、`backups/`、pending 文件）。
-
-状态永远落在运行目录，不进仓库；回滚 asar 全靠运行目录里的 `backups/`，别清。
-
-## 免责声明
-
-本工具修改 ZCode 安装目录内的 `app.asar`，属非官方改动，风险自担。若未来 ZCode 启用
-asar 完整性校验导致无法启动，先跑 `remove` 恢复官方字节再反馈。
+- [维护文档](docs/maintenance.md)：命令、状态文件、排错、新版本适配与开发验证。
+- [AGENTS.md](AGENTS.md)：仓库职责划分与修改约束。
+- [修复技能](skill/zcode-speed-repair/SKILL.md)：供 agent 执行安装、修复、卸载和版本适配。

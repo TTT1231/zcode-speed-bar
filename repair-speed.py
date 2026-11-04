@@ -1,12 +1,20 @@
-r"""Install, remove, or check the speed-only bridge. Does not install a ZCode plugin.
+r"""Manage the speed bar injected into ZCode's app.asar. The default command is check.
 
-Usage: python repair-speed.py [install|remove|check|deploy|add-version] [--asar PATH]
-This clone is the source of truth. Machine-local state and the deployed copies of
-the runtime files live in ~/.zcode/zcode-speed; `install` and `deploy` sync them
-there. app.asar is located automatically (Windows uninstall registry, then common
-install roots); pass --asar to override. Known versions live in targets.json next
-to this script; add-version registers new ones after a ZCode upgrade. Only
-verified host assets are accepted.
+This clone is the source of truth. Machine-local state and deployed runtime files
+live in ~/.zcode/zcode-speed. install and deploy sync the runtime files; remove
+also syncs them before stripping the recognized bridge and loader. Removal
+normally cleans the runtime directory, keeping backups/ after an unverified
+--force strip. Running this script from inside that directory preserves it.
+
+app.asar is located automatically through the Windows uninstall registry and
+common install roots; pass --asar to override. Known versions live in targets.json
+next to this script; add-version records a version with the registry variable
+supplied by the caller. Runtime compatibility still needs separate validation.
+
+Registered renderer fingerprints are checked; mainSha256 is recorded but not
+checked. Repacking verifies file contents, not whole-archive equality with an
+official package. See docs/maintenance.md in the source repository for commands,
+pending handling, validation, and backup limits.
 """
 import argparse
 import copy
@@ -184,6 +192,25 @@ def save_status(**fields):
     fields["updatedAt"] = time.time()
     (RUNTIME / "install-status.json").write_text(json.dumps(fields, ensure_ascii=False, indent=2), encoding="utf-8")
 
+def purge_runtime(keep_backups):
+    """Delete the runtime directory once nothing injected is left that might need restoring."""
+    if not RUNTIME.is_dir():
+        return "already absent"
+    if SRC == RUNTIME.resolve():
+        return "kept: this script runs inside it; delete the directory manually"
+    if keep_backups:
+        # Unverified strip: keep the backups for manual rollback, drop everything else.
+        for child in RUNTIME.iterdir():
+            if child.name == "backups":
+                continue
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+        return "cleared; backups/ kept for manual rollback (unverified --force strip)"
+    shutil.rmtree(RUNTIME, ignore_errors=True)
+    return "purged" if not RUNTIME.exists() else f"not fully deleted; remove {RUNTIME} manually"
+
 def ensure_no_pending(archive):
     meta_path = RUNTIME / "pending-install.json"
     pending = archive.with_name(archive.name + ".zspeed.pending")
@@ -223,6 +250,9 @@ def wait_for_unlock(archive):
         save_status(state=final, version=meta["version"], verifiedFiles=meta["verifiedFiles"],
                     backup=meta["backup"], restartRequired=True)
         meta_path.unlink(missing_ok=True)
+        purge = meta.get("purge")
+        if purge and meta.get("intent") == "remove":
+            purge_runtime(purge.get("keepBackups", False))
         return 0
     save_status(state="waiting-expired", reason="ZCode did not release the file within 24 hours")
     return 1
@@ -300,7 +330,10 @@ def remove_plan(stream, nodes, base, targets, version, force):
     old, wanted = {MAIN: old_main}, {MAIN: LOADER_RE.sub(b"", old_main)}
     if asset_path is not None:
         old[asset_path], wanted[asset_path] = old_asset, new_asset
-    return asset_path, old, wanted
+    # Verified only when a registered fingerprint confirmed the clean result; an
+    # unverified --force strip keeps the backups around for manual rollback.
+    verified = entry is not None or asset_path is None
+    return asset_path, old, wanted, verified
 
 def syntax_check(contents):
     node = shutil.which("node")
@@ -378,7 +411,7 @@ def verify_repack(source, destination, changes):
             checked += 1
         return checked
 
-def apply(archive, intent, version, old, wanted, report):
+def apply(archive, intent, version, old, wanted, report, purge_after=None):
     """Shared install/remove pipeline: backup, repack, verify, replace or pend."""
     original_stamp = stamp(archive)
     changes = {name: data for name, data in wanted.items() if old[name] != data}
@@ -406,7 +439,8 @@ def apply(archive, intent, version, old, wanted, report):
         except PermissionError:
             metadata = {"intent": intent, "version": version, "asar": str(archive), "runtime": str(RUNTIME),
                         "originalStamp": original_stamp, "pending": str(pending),
-                        "sha256": file_sha(pending), "verifiedFiles": checked, "backup": str(backup)}
+                        "sha256": file_sha(pending), "verifiedFiles": checked, "backup": str(backup),
+                        "purge": purge_after}
             (RUNTIME / "pending-install.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
             keep_pending = True
             save_status(state="pending", intent=intent, version=version,
@@ -414,6 +448,8 @@ def apply(archive, intent, version, old, wanted, report):
             monitor_pid = start_waiter(archive)
             report.update(state="pending-until-ZCode-exits", intent=intent,
                           verifiedFiles=checked, backup=str(backup), monitorPid=monitor_pid, pending=True)
+            if purge_after is not None:
+                report["runtimeDir"] = "deleted automatically once the pending removal completes"
             print(json.dumps(report, ensure_ascii=False, indent=2))
             return 0
     finally:
@@ -423,6 +459,8 @@ def apply(archive, intent, version, old, wanted, report):
     save_status(state=final, version=version, verifiedFiles=checked, backup=str(backup), restartRequired=True)
     if intent == "install":
         report.update(bridge=True, loader=True)
+    if purge_after is not None:
+        report["runtimeDir"] = purge_runtime(purge_after["keepBackups"])
     report.update(state=final, verifiedFiles=checked, backup=str(backup), restartRequired=True)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
@@ -502,7 +540,7 @@ def main():
         nodes = dict(files(header))
         version = read_version(stream, nodes, base)
         if args.command == "remove":
-            asset_path, old, wanted = remove_plan(stream, nodes, base, targets, version, args.force)
+            asset_path, old, wanted, verified = remove_plan(stream, nodes, base, targets, version, args.force)
         else:
             asset_path, old, wanted = install_plan(stream, nodes, base, targets, version)
     changes = {name: data for name, data in wanted.items() if old[name] != data}
@@ -523,9 +561,11 @@ def main():
         if args.command == "remove":
             save_status(state="removed", version=version)
             report.update(state="removed", alreadyClean=True)
+            report["runtimeDir"] = purge_runtime(keep_backups=not verified)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
-    return apply(archive, args.command, version, old, wanted, report)
+    purge_after = {"keepBackups": not verified} if args.command == "remove" else None
+    return apply(archive, args.command, version, old, wanted, report, purge_after)
 
 if __name__ == "__main__":
     raise SystemExit(main())
