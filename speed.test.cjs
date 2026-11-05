@@ -225,22 +225,30 @@ function rendererFixture() {
   let now = 0;
   const listeners = new Map();
   class Element {
-    constructor(tag, attributes = {}) { this.tag = tag; this.attributes = attributes; this.style = {}; this.children = []; this.isConnected = false; }
+    constructor(tag, attributes = {}) { this.tag = tag; this.attributes = attributes; this.style = {}; this.children = []; this.hidden = false; }
+    get isConnected() { return this === body || !!this.parent?.isConnected; }
     setAttribute(key, value) { this.attributes[key] = value; }
     getAttribute(key) { return this.attributes[key] || null; }
-    append(...elements) { for (const el of elements) { el.parent = this; el.isConnected = true; this.children.push(el); } }
+    append(...elements) { for (const el of elements) { el.parent = this; this.children.push(el); } }
     appendChild(element) { this.append(element); return element; }
-    remove() { this.isConnected = false; this.parent.children = this.parent.children.filter(el => el !== this); }
-    getClientRects() { return this.isConnected ? [{}] : []; }
+    remove() { this.parent.children = this.parent.children.filter(el => el !== this); this.parent = null; }
+    getClientRects() { return this.isConnected && !this.hidden ? [{}] : []; }
     getBoundingClientRect() { return { width: 500, height: 700 }; }
     closest() { return this.attributes["data-session-id"] ? this : this.parent?.closest(); }
   }
-  const body = new Element("body"); body.isConnected = true;
+  const body = new Element("body");
   body.classList = { contains: () => false };
-  const pane = new Element("section", { "data-testid": "v4-session-pane-workspace-main", "data-session-id": "s1" });
-  body.append(pane);
+  const panes = [];
+  function addPane(sid, paneId) {
+    const pane = new Element("section", { "data-testid": "v4-session-pane-" + paneId, "data-session-id": sid });
+    body.append(pane);
+    panes.push(pane);
+    return pane;
+  }
+  const pane = addPane("s1", "workspace-main");
   const document = { body, documentElement: body, activeElement: pane,
-    createElement: tag => new Element(tag), createElementNS: (_namespace, tag) => new Element(tag), querySelectorAll: () => [pane],
+    createElement: tag => new Element(tag), createElementNS: (_namespace, tag) => new Element(tag),
+    querySelectorAll: () => panes.filter(pane => pane.isConnected),
     addEventListener: (name, listener) => listeners.set(name, listener),
     removeEventListener: name => listeners.delete(name) };
   const bridge = bridgeFixture();
@@ -250,13 +258,15 @@ function rendererFixture() {
   };
   const context = vm.createContext({ window, document, performance: { now: () => now } });
   const source = "(" + rendererMain.toString() + ")(" + createSpeedMeter.toString() + "," + JSON.stringify(VERSION) + ")";
-  return { context, window, document, body, pane, bridge, source, listeners, setNow: time => { now = time; } };
+  return { context, window, document, body, pane, bridge, source, listeners, addPane,
+    barFor: pane => pane.children.find(element => element.className === "zusage-speed-mini"),
+    setNow: time => { now = time; } };
 }
 
-test("renderer keeps one speed-only capsule, updates in place and cleans up", () => {
+test("renderer keeps one speed-only capsule per chat, updates in place and cleans up", () => {
   const f = rendererFixture();
   vm.runInContext(f.source, f.context);
-  const capsule = f.body.children[1];
+  const capsule = f.barFor(f.pane);
   assert.equal(capsule.children.length, 4);
   assert.equal(capsule.children[2].textContent, "t/s");
   f.setNow(500);
@@ -264,12 +274,14 @@ test("renderer keeps one speed-only capsule, updates in place and cleans up", ()
   assert.equal(f.window.__ZSPEED_TICK__().tps, 100);
   assert.equal(capsule.children[1].textContent, "100.0");
   vm.runInContext(f.source, f.context);
-  assert.equal(f.body.children.length, 2);
+  assert.equal(f.pane.children.length, 1);
+  assert.equal(f.barFor(f.pane), capsule);
   f.pane.attributes["data-session-id"] = "s2";
   assert.equal(f.window.__ZSPEED_TICK__().tps, null);
   assert.equal(capsule.children[1].textContent, "—");
   f.window.__ZSPEED_DISPOSE__();
   assert.equal(f.body.children.length, 1);
+  assert.equal(f.pane.children.length, 0);
   assert.equal(f.listeners.size, 0);
 });
 
@@ -288,6 +300,121 @@ test("A to B to A keeps independent live speeds while both conversations generat
     assert.equal(result.sessionId, sid);
     assert.equal(result.tps, expected, `switch to ${sid} at ${now}ms`);
   }
+});
+
+test("main and auxiliary chats run in parallel and keep their own bars after the main chat finishes", () => {
+  const f = rendererFixture();
+  const auxiliary = structuredClone(f.bridge.snapshot);
+  auxiliary.sessionId = "child";
+  f.bridge.entry.layer.entries.set("session:child", { store: { getState: () => ({ snapshot: auxiliary }) } });
+  const auxiliaryPane = f.addPane("child", "selection-side-chat:workspace:s1:child");
+  vm.runInContext(f.source, f.context);
+  const mainBar = f.barFor(f.pane), auxiliaryBar = f.barFor(auxiliaryPane);
+  assert.ok(mainBar, "the main chat must own its bar");
+  assert.ok(auxiliaryBar, "the auxiliary chat must own its bar");
+  assert.notEqual(mainBar, auxiliaryBar);
+  for (const now of [500, 1000, 1500, 2000, 2500, 3000, 3500, 4000]) {
+    f.setNow(now);
+    if (now < 3000) f.bridge.snapshot.rows.window[1].text += "a".repeat(100);
+    else {
+      f.bridge.snapshot.control.phase = "completedSuccess";
+      Object.assign(f.bridge.snapshot.rows.window[0], { state: "completedSuccess", outputTokens: 100, modelDurationMs: 2000 });
+    }
+    auxiliary.rows.window[1].text += "b".repeat(200);
+    f.document.activeElement = now % 1000 === 0 ? auxiliaryPane : f.pane;
+    f.window.__ZSPEED_TICK__();
+    assert.equal(mainBar.children[1].textContent, now < 3000 ? "100.0" : "50.0");
+    assert.equal(auxiliaryBar.children[1].textContent, "200.0");
+    assert.equal(f.barFor(f.pane), mainBar);
+    assert.equal(f.barFor(auxiliaryPane), auxiliaryBar);
+  }
+});
+
+test("an auxiliary chat can finish while the main chat keeps generating independently", () => {
+  const f = rendererFixture();
+  const auxiliary = structuredClone(f.bridge.snapshot);
+  auxiliary.sessionId = "child";
+  f.bridge.entry.layer.entries.set("session:child", { store: { getState: () => ({ snapshot: auxiliary }) } });
+  const auxiliaryPane = f.addPane("child", "selection-side-chat:workspace:s1:child");
+  vm.runInContext(f.source, f.context);
+  for (const now of [500, 1000, 1500, 2000]) {
+    f.setNow(now);
+    f.bridge.snapshot.rows.window[1].text += "a".repeat(100);
+    if (now < 1500) auxiliary.rows.window[1].text += "b".repeat(200);
+    else {
+      auxiliary.control.phase = "completedSuccess";
+      Object.assign(auxiliary.rows.window[0], { state: "completedSuccess", outputTokens: 100, modelDurationMs: 4000 });
+    }
+    f.document.activeElement = auxiliaryPane;
+    f.window.__ZSPEED_TICK__();
+    assert.equal(f.barFor(f.pane).children[1].textContent, "100.0");
+    assert.equal(f.barFor(auxiliaryPane).children[1].textContent, now < 1500 ? "200.0" : "25.0");
+  }
+});
+
+test("auxiliary bars follow tab visibility and closing without replacing the main bar", () => {
+  const f = rendererFixture();
+  const auxiliary = structuredClone(f.bridge.snapshot);
+  auxiliary.sessionId = "child";
+  f.bridge.entry.layer.entries.set("session:child", { store: { getState: () => ({ snapshot: auxiliary }) } });
+  const auxiliaryPane = f.addPane("child", "selection-side-chat:workspace:s1:child");
+  vm.runInContext(f.source, f.context);
+  const mainBar = f.barFor(f.pane), auxiliaryBar = f.barFor(auxiliaryPane);
+  assert.ok(mainBar);
+  assert.ok(auxiliaryBar);
+  auxiliaryPane.hidden = true;
+  f.setNow(500); auxiliary.rows.window[1].text += "b".repeat(200);
+  f.window.__ZSPEED_TICK__();
+  assert.equal(auxiliaryBar.isConnected, false);
+  assert.equal(f.barFor(f.pane), mainBar);
+  auxiliaryPane.hidden = false;
+  f.setNow(1000); auxiliary.rows.window[1].text += "b".repeat(200);
+  f.window.__ZSPEED_TICK__();
+  assert.equal(f.barFor(auxiliaryPane).children[1].textContent, "200.0");
+  auxiliaryPane.attributes["data-session-id"] = "unavailable-child";
+  f.window.__ZSPEED_TICK__();
+  assert.equal(f.barFor(auxiliaryPane).children[1].textContent, "—");
+  auxiliaryPane.remove();
+  f.window.__ZSPEED_TICK__();
+  assert.equal(auxiliaryPane.children.length, 0);
+  assert.equal(f.barFor(f.pane), mainBar);
+  f.window.__ZSPEED_DISPOSE__();
+  assert.equal(f.pane.children.length, 0);
+  assert.equal(f.listeners.size, 0);
+});
+
+test("older bridges sample an auxiliary chat before it receives focus", () => {
+  const f = rendererFixture();
+  delete f.window.__ZSPEED_READ_ALL__;
+  const auxiliary = structuredClone(f.bridge.snapshot);
+  auxiliary.sessionId = "child";
+  f.bridge.entry.layer.entries.set("session:child", { store: { getState: () => ({ snapshot: auxiliary }) } });
+  const auxiliaryPane = f.addPane("child", "selection-side-chat:workspace:s1:child");
+  vm.runInContext(f.source, f.context);
+  f.setNow(500);
+  f.bridge.snapshot.rows.window[1].text += "a".repeat(100);
+  auxiliary.rows.window[1].text += "b".repeat(200);
+  f.window.__ZSPEED_TICK__();
+  assert.equal(f.barFor(f.pane)?.children[1].textContent, "100.0");
+  assert.equal(f.barFor(auxiliaryPane)?.children[1].textContent, "200.0");
+});
+
+test("replacing a renderer version disposes every conversation's old bar", () => {
+  const f = rendererFixture();
+  const auxiliaryPane = f.addPane("child", "selection-side-chat:workspace:s1:child");
+  vm.runInContext(f.source, f.context);
+  const oldMainBar = f.barFor(f.pane), oldAuxiliaryBar = f.barFor(auxiliaryPane);
+  f.window.__ZSPEED_VERSION__ = "old-version";
+  vm.runInContext(f.source, f.context);
+  assert.equal(oldMainBar.isConnected, false);
+  assert.equal(oldAuxiliaryBar.isConnected, false);
+  assert.equal(f.pane.children.length, 1);
+  assert.equal(auxiliaryPane.children.length, 1);
+  assert.equal(f.listeners.size, 2);
+  f.window.__ZSPEED_DISPOSE__();
+  assert.equal(f.pane.children.length, 0);
+  assert.equal(auxiliaryPane.children.length, 0);
+  assert.equal(f.listeners.size, 0);
 });
 
 test("older bridges keep sampling previously visited conversations", () => {
@@ -334,7 +461,7 @@ test("main clock drives 500ms renderer sampling and only injects local host wind
   for (const time of [500, 1000, 1500, 2000]) {
     f.setNow(time); f.bridge.snapshot.rows.window[1].text += "a".repeat(100);
     callback(); await flush();
-    assert.equal(f.body.children[1].children[1].textContent, "100.0");
+    assert.equal(f.barFor(f.pane).children[1].textContent, "100.0");
   }
   assert.equal(reads, 5);
   app.emit("before-quit");

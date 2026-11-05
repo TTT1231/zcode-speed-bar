@@ -3,11 +3,12 @@
  * Live: a 2s rolling window of assistant/reasoning/tool-input characters.
  * Finished: outputTokens / modelDurationMs from the host's turn summary.
  * Each available conversation is sampled in the background, including inactive tabs.
+ * Main and auxiliary conversations each display a bar inside their own pane.
  * repair-speed.py installs the small read-only bridge after a ZCode upgrade.
  * Reference: ByteRax/zcode-token-usage-statusbar, renderer bridge for 3.17.1.
  */
 "use strict";
-const VERSION = "store-speed-4";
+const VERSION = "store-speed-5";
 const REFRESH_MS = 500;
 
 // Self-contained: the same calculation runs in Electron and regression tests.
@@ -148,7 +149,8 @@ function rendererMain(makeMeter, version) {
   if (typeof window.__ZSPEED_DISPOSE__ === "function") window.__ZSPEED_DISPOSE__();
   window.__ZSPEED_VERSION__ = version;
   const meter = makeMeter();
-  let bar = null, value = null, lastPane = null, signature = "";
+  const bars = new Map();
+  let lastPane = null;
   function visible(pane) {
     if (!pane || !pane.isConnected || !pane.getClientRects().length) return false;
     const rect = pane.getBoundingClientRect();
@@ -162,21 +164,21 @@ function rendererMain(makeMeter, version) {
     const pane = paneOf(event.target);
     if (visible(pane)) lastPane = pane;
   }
-  function pickPane() {
+  function pickPane(panes) {
     const focused = paneOf(document.activeElement);
-    if (visible(focused)) return focused;
-    if (visible(lastPane)) return lastPane;
-    const panes = Array.from(document.querySelectorAll('[data-testid^="v4-session-pane-"][data-session-id]')).filter(visible);
+    if (panes.includes(focused)) return focused;
+    if (panes.includes(lastPane)) return lastPane;
     return panes.find(pane => pane.getAttribute("data-testid") === "v4-session-pane-workspace-main") || panes[0] || null;
   }
-  function ensure() {
-    if (bar && bar.isConnected) return;
-    bar = document.createElement("div");
+  function ensure(pane) {
+    const existing = bars.get(pane);
+    if (existing && existing.bar.isConnected) return existing;
+    const bar = document.createElement("div");
     bar.className = "zusage-speed-mini";
     bar.setAttribute("role", "status");
     bar.setAttribute("aria-live", "off");
     bar.setAttribute("aria-atomic", "true");
-    bar.style.cssText = "position:fixed;left:50%;transform:translateX(-50%);bottom:8px;z-index:2147483000;"
+    bar.style.cssText = "position:absolute;left:50%;transform:translateX(-50%);bottom:8px;z-index:2147483000;"
       + "display:flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;"
       + "box-sizing:border-box;border:1px solid var(--zs-border);"
       + "font:600 12px/16px var(--font-mono,ui-monospace,Consolas,monospace);"
@@ -208,16 +210,19 @@ function rendererMain(makeMeter, version) {
     const glyph = document.createElementNS("http://www.w3.org/2000/svg", "path");
     glyph.setAttribute("d", "M13 3 4 14h7l-1 7 10-12h-7l1-6Z");
     bolt.appendChild(glyph);
-    value = document.createElement("span"); value.textContent = "—";
+    const value = document.createElement("span"); value.textContent = "—";
     value.setAttribute("data-tps", "");
     const unit = document.createElement("span"); unit.textContent = "t/s";
     unit.setAttribute("data-speed-unit", "");
     bar.append(bolt, value, unit, style);
-    (document.body || document.documentElement).appendChild(bar);
-    signature = "";
+    pane.appendChild(bar);
+    const entry = { bar, value, signature: "" };
+    bars.set(pane, entry);
+    return entry;
   }
   function tick() {
-    const pane = pickPane();
+    const panes = Array.from(document.querySelectorAll('[data-testid^="v4-session-pane-"][data-session-id]')).filter(visible);
+    const pane = pickPane(panes);
     const sid = pane && pane.getAttribute("data-session-id");
     const hasBridge = typeof window.__ZSPEED_READ__ === "function";
     let snapshots = [];
@@ -225,25 +230,34 @@ function rendererMain(makeMeter, version) {
     else if (hasBridge) {
       // An older bridge can still keep previously visited conversations warm.
       const known = new Set(meter.sessionIds());
-      if (sid && sid !== "draft") known.add(sid);
+      for (const pane of panes) {
+        const sessionId = pane.getAttribute("data-session-id");
+        if (sessionId && sessionId !== "draft") known.add(sessionId);
+      }
       snapshots = Array.from(known, sessionId => window.__ZSPEED_READ__(sessionId)).filter(Boolean);
     }
     meter.sampleAll(snapshots, performance.now());
-    const result = meter.get(sid);
-    ensure();
-    bar.style.display = pane ? "flex" : "none";
-    bar.setAttribute("data-zspeed-theme", document.documentElement.classList.contains("dark") ? "dark" : "light");
-    const tps = Number.isFinite(result.tps) && result.tps >= 0 ? result.tps : null;
-    const label = tps === null ? "—" : tps.toFixed(1);
-    const next = label + ":" + result.mode;
-    if (next !== signature) {
-      signature = next;
-      value.textContent = label;
-      bar.setAttribute("data-speed-band", tps === null || tps === 0 ? "idle" : tps >= 70 ? "fast" : tps >= 40 ? "medium" : "slow");
-      bar.title = tps === null ? "正在采样生成速度" : result.est ? "实时估算速度 · 每 0.5 秒刷新" : "最近完成一轮的生成速度";
-      bar.setAttribute("aria-label", tps === null ? "正在采样生成速度" : (result.est ? "生成速度约 " : "生成速度 ") + label + " token/s");
+    for (const [pane, entry] of bars) {
+      if (!panes.includes(pane)) { entry.bar.remove(); bars.delete(pane); }
     }
-    return { ...result, bridge: hasBridge, tickAt: Date.now() };
+    const theme = document.documentElement.classList.contains("dark") ? "dark" : "light";
+    for (const pane of panes) {
+      const result = meter.get(pane.getAttribute("data-session-id"));
+      const entry = ensure(pane), { bar, value } = entry;
+      bar.setAttribute("data-zspeed-theme", theme);
+      const tps = Number.isFinite(result.tps) && result.tps >= 0 ? result.tps : null;
+      const label = tps === null ? "—" : tps.toFixed(1);
+      const next = label + ":" + result.mode;
+      if (next !== entry.signature) {
+        entry.signature = next;
+        value.textContent = label;
+        bar.setAttribute("data-speed-band", tps === null || tps === 0 ? "idle" : tps >= 70 ? "fast" : tps >= 40 ? "medium" : "slow");
+        bar.title = tps === null ? "正在采样生成速度" : result.est ? "实时估算速度 · 每 0.5 秒刷新" : "最近完成一轮的生成速度";
+        bar.setAttribute("aria-label", tps === null ? "正在采样生成速度" : (result.est ? "生成速度约 " : "生成速度 ") + label + " token/s");
+      }
+    }
+    // Keep the existing diagnostic status focused on the selected conversation.
+    return { ...meter.get(sid), bridge: hasBridge, tickAt: Date.now() };
   }
   document.addEventListener("pointerdown", rememberPane, true);
   document.addEventListener("focusin", rememberPane, true);
@@ -251,7 +265,9 @@ function rendererMain(makeMeter, version) {
   window.__ZSPEED_DISPOSE__ = function () {
     document.removeEventListener("pointerdown", rememberPane, true);
     document.removeEventListener("focusin", rememberPane, true);
-    if (bar) bar.remove();
+    for (const entry of bars.values()) entry.bar.remove();
+    bars.clear();
+    lastPane = null;
     meter.reset();
     delete window.__ZSPEED_TICK__; delete window.__ZSPEED_DISPOSE__;
     delete window.__ZSPEED_VERSION__;
