@@ -221,20 +221,138 @@ test("bridge ignores stale/closed stores and rejects ambiguous sessions", () => 
   assert.equal(f.context.__ZSPEED_READ__("s1"), null);
 });
 
+function childStores(bridge, snapshots) {
+  const layer = bridge.entry.layer, acquired = [], released = [];
+  layer.acquire = sid => {
+    const snapshot = snapshots.get(sid);
+    if (!snapshot) throw new Error("unknown child");
+    const key = "session:" + sid, existing = layer.entries.get(key);
+    if (!existing) layer.entries.set(key, { store: { getState: () => ({ snapshot }) } });
+    acquired.push(sid);
+    return { release() { released.push(sid); if (!existing) layer.entries.delete(key); } };
+  };
+  return { acquired, released };
+}
+
+function childSnapshot(sid) {
+  return { sessionId: sid, logEpoch: "e1", control: { phase: "running" }, rows: { window: [
+    { rowId: 1, turnId: "t1", kind: "turnHeader", state: "running" },
+    { rowId: 2, turnId: "t1", kind: "assistantText", state: "streaming", text: "" }
+  ] } };
+}
+
+test("bridge links agent tool calls by turn and parent ID and releases child leases", () => {
+  const f = bridgeFixture(), rows = f.snapshot.rows.window;
+  rows.push(
+    { rowId: 10, turnId: "t1", kind: "toolCall", toolName: "Agent", toolCallId: "call-a", inputText: "private prompt" },
+    { rowId: 11, turnId: "t1", kind: "toolCall", toolName: "Agent", toolCallId: "call-b" },
+    { rowId: 20, turnId: "t1", kind: "subagent", parentToolCallId: "call-b", childSessionId: "child-b", status: "running" },
+    { rowId: 21, turnId: "t1", kind: "subagent", parentToolCallId: "call-a", childSessionId: "child-a", status: "running" }
+  );
+  const children = new Map([["child-a", childSnapshot("child-a")], ["child-b", childSnapshot("child-b")]]);
+  const leases = childStores(f, children);
+  const before = JSON.stringify(f.snapshot);
+  const parent = f.context.__ZSPEED_READ__("s1");
+  assert.deepEqual(Array.from(parent.agents, a => [a.toolCallId, a.childSessionId]), [["call-a", "child-a"], ["call-b", "child-b"]]);
+  assert.deepEqual(leases.acquired, ["child-a", "child-b"]);
+  assert.equal(JSON.stringify(f.snapshot), before);
+  assert.doesNotMatch(JSON.stringify(parent), /private prompt|do not count|中|想/);
+  assert.ok(f.context.__ZSPEED_READ__("child-a"));
+  rows.find(row => row.childSessionId === "child-a").status = "completed";
+  f.context.__ZSPEED_READ_ALL__();
+  assert.deepEqual(leases.released, [], "a finished child's final result remains available while its row remains");
+  rows.splice(rows.findIndex(row => row.childSessionId === "child-a"), 1);
+  f.context.__ZSPEED_READ_ALL__();
+  assert.deepEqual(leases.released, ["child-a"]);
+  f.context.__ZSPEED_RELEASE_CHILDREN__();
+  assert.deepEqual(leases.released, ["child-a", "child-b"]);
+});
+
+test("bridge never guesses between multiple unmatched or conflicting agent calls", () => {
+  const f = bridgeFixture(), rows = f.snapshot.rows.window;
+  rows.push(
+    { rowId: 10, turnId: "t1", kind: "toolCall", toolName: "Agent", toolCallId: "a" },
+    { rowId: 11, turnId: "t1", kind: "toolCall", toolName: "Agent", toolCallId: "b" },
+    { rowId: 20, turnId: "t1", kind: "subagent", childSessionId: "child-a", status: "running" },
+    { rowId: 21, turnId: "t1", kind: "subagent", childSessionId: "child-b", status: "running" }
+  );
+  const leases = childStores(f, new Map([["child-a", childSnapshot("child-a")], ["child-b", childSnapshot("child-b")]]));
+  let agents = f.context.__ZSPEED_READ__("s1").agents;
+  assert.deepEqual(Array.from(agents, a => a.childSessionId), [undefined, undefined]);
+  assert.deepEqual(leases.acquired, []);
+  rows[rows.length - 2].parentToolCallId = "a";
+  agents = f.context.__ZSPEED_READ__("s1").agents;
+  assert.deepEqual(Array.from(agents, a => a.childSessionId), ["child-a", "child-b"]);
+  rows.push({ rowId: 22, turnId: "t1", kind: "subagent", parentToolCallId: "a", childSessionId: "child-c", status: "running" });
+  agents = f.context.__ZSPEED_READ__("s1").agents;
+  assert.equal(agents[0].childSessionId, undefined);
+  assert.deepEqual(leases.released, ["child-a", "child-b"]);
+  f.entry.stale = true;
+  f.context.__ZSPEED_READ_ALL__();
+  assert.deepEqual(leases.released, ["child-a", "child-b"]);
+});
+
+test("child subscriptions follow a parent reconnect and are bounded in favor of running agents", () => {
+  const f = bridgeFixture(), rows = f.snapshot.rows.window;
+  const children = new Map();
+  const add = i => {
+    const sid = "child-" + i, toolId = "call-" + i;
+    children.set(sid, childSnapshot(sid));
+    rows.push({ rowId: 10 + i, turnId: "t1", kind: "toolCall", toolName: "Agent", toolCallId: toolId });
+    rows.push({ rowId: 100 + i, turnId: "t1", kind: "subagent", parentToolCallId: toolId, childSessionId: sid, status: "running" });
+  };
+  for (let i = 0; i < 64; i++) add(i);
+  const leases = childStores(f, children);
+  f.context.__ZSPEED_READ_ALL__();
+  assert.equal(leases.acquired.length, 64);
+  rows.find(row => row.childSessionId === "child-0").status = "completed";
+  add(64);
+  f.context.__ZSPEED_READ_ALL__();
+  assert.deepEqual(leases.released, ["child-0"]);
+  assert.equal(leases.acquired.at(-1), "child-64");
+  f.store.getState = () => ({ snapshot: f.snapshot, status: "connecting", projectionReady: false });
+  f.context.__ZSPEED_READ_ALL__();
+  assert.equal(leases.released.length, 65);
+  f.store.getState = () => ({ snapshot: f.snapshot, status: "live", projectionReady: true });
+  f.context.__ZSPEED_READ_ALL__();
+  assert.equal(leases.acquired.length, 129);
+  assert.equal(leases.acquired.at(-1), "child-64");
+  f.context.__ZSPEED_RELEASE_CHILDREN__();
+});
+
 function rendererFixture() {
   let now = 0;
   const listeners = new Map();
   class Element {
     constructor(tag, attributes = {}) { this.tag = tag; this.attributes = attributes; this.style = {}; this.children = []; this.hidden = false; }
     get isConnected() { return this === body || !!this.parent?.isConnected; }
+    get parentElement() { return this.parent || null; }
     setAttribute(key, value) { this.attributes[key] = value; }
     getAttribute(key) { return this.attributes[key] || null; }
     append(...elements) { for (const el of elements) { el.parent = this; this.children.push(el); } }
     appendChild(element) { this.append(element); return element; }
-    remove() { this.parent.children = this.parent.children.filter(el => el !== this); this.parent = null; }
+    remove() { if (this.parent) this.parent.children = this.parent.children.filter(el => el !== this); this.parent = null; }
     getClientRects() { return this.isConnected && !this.hidden ? [{}] : []; }
     getBoundingClientRect() { return { width: 500, height: 700 }; }
-    closest() { return this.attributes["data-session-id"] ? this : this.parent?.closest(); }
+    closest(selector) {
+      const key = selector.includes("data-session-id") ? "data-session-id"
+        : selector.includes("data-row-id") ? "data-row-id" : "data-tool-call-id";
+      return this.attributes[key] ? this : this.parent?.closest(selector) || null;
+    }
+    querySelectorAll(selector) {
+      const found = [];
+      const visit = element => {
+        for (const child of element.children) {
+          const id = child.getAttribute("data-testid") || "";
+          if (selector.includes("data-tool-name")
+            ? child.getAttribute("data-tool-call-id") && child.getAttribute("data-tool-name")
+            : id.startsWith("tool-summary-trigger-") || id.startsWith("v4-subagent-open-side-pane-")) found.push(child);
+          visit(child);
+        }
+      };
+      visit(this);
+      return found;
+    }
   }
   const body = new Element("body");
   body.classList = { contains: () => false };
@@ -254,11 +372,12 @@ function rendererFixture() {
   const bridge = bridgeFixture();
   const window = {
     __ZSPEED_READ__: sid => bridge.context.__ZSPEED_READ__(sid),
-    __ZSPEED_READ_ALL__: () => bridge.context.__ZSPEED_READ_ALL__()
+    __ZSPEED_READ_ALL__: () => bridge.context.__ZSPEED_READ_ALL__(),
+    __ZSPEED_RELEASE_CHILDREN__: () => bridge.context.__ZSPEED_RELEASE_CHILDREN__()
   };
   const context = vm.createContext({ window, document, performance: { now: () => now } });
   const source = "(" + rendererMain.toString() + ")(" + createSpeedMeter.toString() + "," + JSON.stringify(VERSION) + ")";
-  return { context, window, document, body, pane, bridge, source, listeners, addPane,
+  return { context, window, document, body, pane, bridge, source, listeners, addPane, Element,
     barFor: pane => pane.children.find(element => element.className === "zusage-speed-mini"),
     setNow: time => { now = time; } };
 }
@@ -283,6 +402,65 @@ test("renderer keeps one speed-only capsule per chat, updates in place and clean
   assert.equal(f.body.children.length, 1);
   assert.equal(f.pane.children.length, 0);
   assert.equal(f.listeners.size, 0);
+});
+
+test("three subagents show their own live, waiting and final rates beside the correct task", () => {
+  const f = rendererFixture(), rows = f.bridge.snapshot.rows.window;
+  rows.splice(2);
+  rows[1].text = "";
+  rows[1].state = "streaming";
+  const children = new Map(), summaries = [], blocks = [], subRows = [];
+  for (const [index, sid] of ["child-a", "child-b", "child-c"].entries()) {
+    const toolId = "call-" + index, rowId = 10 + index;
+    rows.push({ rowId, turnId: "t1", kind: "toolCall", toolName: "Agent", toolCallId: toolId, status: "running" });
+    const sub = { rowId: 20 + index, turnId: "t1", kind: "subagent", parentToolCallId: toolId, childSessionId: sid, status: "running" };
+    rows.push(sub); subRows.push(sub);
+    const child = childSnapshot(sid); children.set(sid, child);
+    const row = new f.Element("div", { "data-row-id": String(rowId) });
+    const block = new f.Element("div", { "data-tool-call-id": toolId, "data-tool-name": "Agent" });
+    const summary = new f.Element("div", { "data-testid": "v4-subagent-open-side-pane-" + sid });
+    f.pane.append(row); row.append(block); block.append(summary);
+    summaries.push(summary); blocks.push(block);
+  }
+  const waiting = children.get("child-c");
+  waiting.rows.window[1].state = "completed";
+  waiting.rows.window.push({ rowId: 3, turnId: "t1", kind: "toolCall", status: "running", inputText: "{}" });
+  const leases = childStores(f.bridge, children);
+  vm.runInContext(f.source, f.context);
+  assert.equal(summaries[0].children[0].textContent, "— t/s");
+  f.setNow(500); rows[1].text += "m".repeat(100); f.window.__ZSPEED_TICK__();
+  assert.equal(summaries[2].children[0].textContent, "0.0 t/s");
+  f.setNow(1000); rows[1].text += "m".repeat(100);
+  children.get("child-a").rows.window[1].text += "a".repeat(80);
+  children.get("child-b").rows.window[1].text += "b".repeat(45);
+  f.window.__ZSPEED_TICK__();
+  assert.equal(f.barFor(f.pane).children[1].textContent, "100.0");
+  assert.deepEqual(summaries.map(summary => summary.children[0].textContent), ["80.0 t/s", "45.0 t/s", "0.0 t/s"]);
+  assert.equal(summaries[0].children[0].style.color, "#087b53");
+  assert.equal(summaries[1].children[0].style.color, "#896008");
+  rows[1].state = "completed";
+  const finished = children.get("child-b");
+  finished.control.phase = "completedSuccess";
+  Object.assign(finished.rows.window[0], { state: "completedSuccess", outputTokens: 100, modelDurationMs: 2000 });
+  subRows[1].status = "completed";
+  f.setNow(1500); children.get("child-a").rows.window[1].text += "a".repeat(80); f.window.__ZSPEED_TICK__();
+  assert.equal(f.barFor(f.pane).children[1].textContent, "0.0");
+  assert.deepEqual(summaries.map(summary => summary.children[0].textContent), ["80.0 t/s", "50.0 t/s", "0.0 t/s"]);
+  const oldBadge = summaries[0].children[0];
+  summaries[0].remove();
+  const replacement = new f.Element("div", { "data-testid": "v4-subagent-open-side-pane-child-a" });
+  blocks[0].append(replacement);
+  f.setNow(2000); children.get("child-a").rows.window[1].text += "a".repeat(80); f.window.__ZSPEED_TICK__();
+  assert.equal(oldBadge.isConnected, false);
+  assert.equal(replacement.children[0].textContent, "80.0 t/s");
+  rows.splice(rows.indexOf(subRows[0]), 1);
+  blocks[0].parentElement.remove();
+  f.window.__ZSPEED_TICK__();
+  assert.ok(leases.released.includes("child-a"));
+  f.window.__ZSPEED_DISPOSE__();
+  assert.equal(replacement.children.length, 0);
+  assert.equal(summaries[1].children.length, 0);
+  assert.deepEqual(leases.released, ["child-a", "child-b", "child-c"]);
 });
 
 test("A to B to A keeps independent live speeds while both conversations generate", () => {

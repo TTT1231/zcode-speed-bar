@@ -8,7 +8,7 @@
  * Reference: ByteRax/zcode-token-usage-statusbar, renderer bridge for 3.17.1.
  */
 "use strict";
-const VERSION = "store-speed-5";
+const VERSION = "store-speed-6";
 const REFRESH_MS = 500;
 
 // Self-contained: the same calculation runs in Electron and regression tests.
@@ -28,7 +28,7 @@ function createSpeedMeter(singleStream = false) {
       const result = entry.meter.update(snapshot, now);
       streams.set(key, entry);
       for (const [oldKey, old] of streams) if (now - old.at > 60000) streams.delete(oldKey);
-      while (streams.size > 64) streams.delete(streams.keys().next().value);
+      while (streams.size > 128) streams.delete(streams.keys().next().value);
       return result;
     }
     function sampleAll(snapshots, now) {
@@ -149,7 +149,7 @@ function rendererMain(makeMeter, version) {
   if (typeof window.__ZSPEED_DISPOSE__ === "function") window.__ZSPEED_DISPOSE__();
   window.__ZSPEED_VERSION__ = version;
   const meter = makeMeter();
-  const bars = new Map();
+  const bars = new Map(), agentBars = new Map();
   let lastPane = null;
   function visible(pane) {
     if (!pane || !pane.isConnected || !pane.getClientRects().length) return false;
@@ -220,6 +220,56 @@ function rendererMain(makeMeter, version) {
     bars.set(pane, entry);
     return entry;
   }
+  function speedInfo(result) {
+    const tps = Number.isFinite(result.tps) && result.tps >= 0 ? result.tps : null;
+    const label = tps === null ? "—" : tps.toFixed(1);
+    return { tps, label,
+      band: tps === null || tps === 0 ? "idle" : tps >= 70 ? "fast" : tps >= 40 ? "medium" : "slow",
+      title: tps === null ? "正在采样生成速度" : result.est ? "实时估算速度 · 每 0.5 秒刷新" : "最近完成一轮的生成速度",
+      aria: tps === null ? "正在采样生成速度" : (result.est ? "生成速度约 " : "生成速度 ") + label + " token/s" };
+  }
+  function ensureAgent(summary) {
+    const old = agentBars.get(summary);
+    if (old && old.isConnected && old.parentElement === summary) return old;
+    if (old) old.remove();
+    const badge = document.createElement("span");
+    badge.className = "zspeed-agent-mini";
+    badge.setAttribute("role", "status");
+    badge.setAttribute("aria-live", "off");
+    badge.style.cssText = "display:inline-block;flex:none;white-space:nowrap;pointer-events:none;user-select:none;"
+      + "font:600 .9em/1.4 var(--font-mono,ui-monospace,Consolas,monospace);font-variant-numeric:tabular-nums";
+    summary.appendChild(badge);
+    agentBars.set(summary, badge);
+    return badge;
+  }
+  function showAgents(pane, snapshot, theme, seen) {
+    if (!snapshot || !Array.isArray(snapshot.agents)) return;
+    const ready = snapshot.projectionReady !== false && (!snapshot.status || snapshot.status === "live");
+    const byRow = new Map();
+    for (const agent of snapshot.agents) {
+      const key = JSON.stringify([String(agent.rowId), agent.toolCallId]);
+      byRow.set(key, byRow.has(key) ? null : agent);
+    }
+    for (const block of pane.querySelectorAll('[data-tool-call-id][data-tool-name]')) {
+      if (paneOf(block) !== pane) continue;
+      const row = block.closest('[data-row-id]');
+      const agent = row && byRow.get(JSON.stringify([row.getAttribute("data-row-id"), block.getAttribute("data-tool-call-id")]));
+      if (!agent) continue;
+      const summary = Array.from(block.querySelectorAll('[data-testid^="tool-summary-trigger-"], [data-testid^="v4-subagent-open-side-pane-"]'))
+        .find(element => element.closest('[data-tool-call-id]') === block);
+      if (!summary) continue;
+      seen.add(summary);
+      const badge = ensureAgent(summary);
+      const info = speedInfo(ready ? meter.get(agent.childSessionId) : { tps: null });
+      const colors = theme === "dark"
+        ? { fast: "#56d6a2", medium: "#ebbf63", slow: "#ff988e", idle: "#adb4c0" }
+        : { fast: "#087b53", medium: "#896008", slow: "#b73d36", idle: "#616b79" };
+      badge.textContent = info.label + " t/s";
+      badge.style.color = colors[info.band];
+      badge.title = info.title;
+      badge.setAttribute("aria-label", info.aria);
+    }
+  }
   function tick() {
     const panes = Array.from(document.querySelectorAll('[data-testid^="v4-session-pane-"][data-session-id]')).filter(visible);
     const pane = pickPane(panes);
@@ -237,24 +287,32 @@ function rendererMain(makeMeter, version) {
       snapshots = Array.from(known, sessionId => window.__ZSPEED_READ__(sessionId)).filter(Boolean);
     }
     meter.sampleAll(snapshots, performance.now());
+    const bySession = new Map();
+    for (const snapshot of snapshots) if (snapshot && typeof snapshot.sessionId === "string") {
+      bySession.set(snapshot.sessionId, bySession.has(snapshot.sessionId) ? null : snapshot);
+    }
     for (const [pane, entry] of bars) {
       if (!panes.includes(pane)) { entry.bar.remove(); bars.delete(pane); }
     }
     const theme = document.documentElement.classList.contains("dark") ? "dark" : "light";
+    const seenAgents = new Set();
     for (const pane of panes) {
       const result = meter.get(pane.getAttribute("data-session-id"));
       const entry = ensure(pane), { bar, value } = entry;
       bar.setAttribute("data-zspeed-theme", theme);
-      const tps = Number.isFinite(result.tps) && result.tps >= 0 ? result.tps : null;
-      const label = tps === null ? "—" : tps.toFixed(1);
-      const next = label + ":" + result.mode;
+      const info = speedInfo(result);
+      const next = info.label + ":" + result.mode;
       if (next !== entry.signature) {
         entry.signature = next;
-        value.textContent = label;
-        bar.setAttribute("data-speed-band", tps === null || tps === 0 ? "idle" : tps >= 70 ? "fast" : tps >= 40 ? "medium" : "slow");
-        bar.title = tps === null ? "正在采样生成速度" : result.est ? "实时估算速度 · 每 0.5 秒刷新" : "最近完成一轮的生成速度";
-        bar.setAttribute("aria-label", tps === null ? "正在采样生成速度" : (result.est ? "生成速度约 " : "生成速度 ") + label + " token/s");
+        value.textContent = info.label;
+        bar.setAttribute("data-speed-band", info.band);
+        bar.title = info.title;
+        bar.setAttribute("aria-label", info.aria);
       }
+      showAgents(pane, bySession.get(pane.getAttribute("data-session-id")), theme, seenAgents);
+    }
+    for (const [summary, badge] of agentBars) if (!seenAgents.has(summary)) {
+      badge.remove(); agentBars.delete(summary);
     }
     // Keep the existing diagnostic status focused on the selected conversation.
     return { ...meter.get(sid), bridge: hasBridge, tickAt: Date.now() };
@@ -266,9 +324,12 @@ function rendererMain(makeMeter, version) {
     document.removeEventListener("pointerdown", rememberPane, true);
     document.removeEventListener("focusin", rememberPane, true);
     for (const entry of bars.values()) entry.bar.remove();
+    for (const badge of agentBars.values()) badge.remove();
     bars.clear();
+    agentBars.clear();
     lastPane = null;
     meter.reset();
+    if (typeof window.__ZSPEED_RELEASE_CHILDREN__ === "function") window.__ZSPEED_RELEASE_CHILDREN__();
     delete window.__ZSPEED_TICK__; delete window.__ZSPEED_DISPOSE__;
     delete window.__ZSPEED_VERSION__;
   };
