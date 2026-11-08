@@ -8,3 +8,8 @@ status.json
 install-status.json
 pending-install.json
 *.zspeed.pending
+
+# AI
+.zcode
+.claude
+.codex
