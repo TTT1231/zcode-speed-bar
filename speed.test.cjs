@@ -5,7 +5,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
-const { createSpeedMeter, rendererMain, VERSION } = require("./inject-main.cjs");
+const sourceDir = path.join(__dirname, "skill", "zcode-speed-repair", "scripts");
+const { createSpeedMeter, rendererMain, VERSION } = require(path.join(sourceDir, "inject-main.cjs"));
 const head = (extra = {}) => ({ id: 1, turnId: "t1", kind: "turnHeader", state: "running", chars: 0, ...extra });
 const text = (chars, extra = {}) => ({ id: 2, turnId: "t1", kind: "assistantText", chars, ...extra });
 const snap = (chars, extra = {}) => ({ sessionId: "s1", epoch: "e1", generation: 1, phase: "running",
@@ -185,7 +186,7 @@ function bridgeFixture() {
   const entry = { layer: { disposed: false, entries: new Map([["session:s1", { store }]]) } };
   const registry = new Map([["workspace", entry]]);
   const context = vm.createContext({ np: registry });
-  const source = fs.readFileSync(path.join(__dirname, "speed-bridge.js"), "utf8")
+  const source = fs.readFileSync(path.join(sourceDir, "speed-bridge.js"), "utf8")
     .replace("__ZSPEED_REGISTRY__", "np");
   vm.runInContext(source, context);
   return { context, store, entry, registry, get snapshot() { return snapshot; }, set snapshot(s) { snapshot = s; } };
@@ -630,7 +631,7 @@ test("main clock drives 500ms renderer sampling and only injects local host wind
     require: name => name === "electron" ? { app, webContents: { getAllWebContents: () => [mainWindow, external, outside] } }
       : name === "fs" ? { appendFile: (_p, _s, done) => done(), writeFile: (_p, _s, done) => done() } : require(name),
     setInterval: (fn, ms) => { callback = fn; interval = ms; return { unref() {} }; }, clearInterval() {} });
-  vm.runInContext(fs.readFileSync(path.join(__dirname, "inject-main.cjs"), "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(sourceDir, "inject-main.cjs"), "utf8"), context);
   context.module.exports.install();
   const flush = () => new Promise(resolve => setImmediate(resolve));
   await flush();

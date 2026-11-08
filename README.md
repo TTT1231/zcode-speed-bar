@@ -14,7 +14,9 @@
 
 ## 安装
 
-准备 Windows 版 ZCode、Python 3.8+ 和可在命令行调用的 Node.js。Python 只使用标准库，Node.js 用于安装时的语法检查，无需安装项目依赖。当前登记的 ZCode 版本是 **3.17.1**，以 [targets.json](targets.json) 为准。
+准备 Windows 版 ZCode **3.17.1 或更高版本**、Python 3.8+ 和可在命令行调用的 Node.js。Python 只使用标准库，Node.js 用于安装时的语法检查，无需安装项目依赖。目前仅登记了 ZCode **3.17.1**；较新版本也须先适配并验证，以 [targets.json](skill/zcode-speed-repair/scripts/targets.json) 为准。
+
+安装前脚本会检查目标 ZCode 的实际版本；低于 3.17.1 或无法识别版本时，输出 `state: skipped` 并停止，不会写入运行文件或安装包。
 
 在 PowerShell 中执行：
 
@@ -24,13 +26,13 @@ cd zcode-speed-bar
 python repair-speed.py install
 ```
 
-`python` 不可用时可换成 `py -3`。工具会通过 Windows 注册表和常见路径寻找安装目录；自动定位失败或存在多份安装时，指定实际路径：
+`python` 不可用时可换成 `py -3`。工具会通过 Windows 注册表和常见路径寻找安装目录；自动定位失败或发现多份安装时，会要求指定实际路径：
 
 ```powershell
 python repair-speed.py install --asar "D:\soft\ZCode\resources\app.asar"
 ```
 
-完成后完全退出 ZCode（包括托盘）再打开。若输出 `pending-until-ZCode-exits`，表示替换正在等待文件解锁：先退出 ZCode，等后台替换完成后再启动，不要重复安装。查看 [pending 处理](docs/maintenance.md#诊断与-pending)。
+完成后完全退出 ZCode（包括托盘）再打开。若输出 `pending-until-ZCode-exits`，表示替换正在等待文件解锁：先退出 ZCode，等后台替换完成后再启动，不要重复安装。安装完成可用下面的 `check` 确认 `pending: false`。
 
 打开一个会话，应能看到悬浮条。检查安装文件：
 
@@ -38,7 +40,7 @@ python repair-speed.py install --asar "D:\soft\ZCode\resources\app.asar"
 python repair-speed.py check
 ```
 
-正常结果为 `bridge: true`、`loader: true`、`pending: false`，退出码为 `0`。自定义安装路径时，检查和卸载也使用同一个 `--asar`。若提示版本未登记，见 [新版本适配](docs/maintenance.md#新版本适配)。
+正常结果为 `bridge: true`、`loader: true`、`pending: false`，退出码为 `0`。自定义安装路径时，检查和卸载也使用同一个 `--asar`。如果提示版本未登记或指纹不匹配，先确认版本和安装来源，不要强制登记以绕过校验。
 
 ## 更新与修复
 
@@ -49,7 +51,7 @@ git pull
 python repair-speed.py install
 ```
 
-完全退出并重开 ZCode。官方升级若覆盖了注入，也按此流程恢复；新版本须先在 `targets.json` 登记并验证。悬浮条不出现、持续显示 `—` 或安装报错时，按 [维护文档](docs/maintenance.md#诊断与-pending) 排查。
+完全退出并重开 ZCode。官方升级若覆盖了注入，也按此流程恢复；新版本须先适配并验证，不能仅凭版本号登记。悬浮条不出现、持续显示 `—` 或安装报错时，运行 `check`，并查看 `~/.zcode/zcode-speed/` 下的 `status.json` 和 `debug.log`。
 
 ## 卸载
 
@@ -61,10 +63,13 @@ python repair-speed.py remove
 
 等待替换完成，再完全退出并重开 ZCode，确认悬浮条消失。正常卸载会移除注入并清理 `~/.zcode/zcode-speed/` 中的运行副本、状态和备份；不要提前删除这个目录。
 
-未登记版本通过 `--force` 剥离桥接时会保留备份；从运行目录执行脚本或文件清理失败时，也可能留下文件。处理方法及还原范围见 [卸载与备份](docs/maintenance.md#卸载与备份)。
+未登记版本通过 `--force` 剥离桥接时会保留备份；从运行目录执行脚本或文件清理失败时，也可能留下文件。备份保存的是修改前的目标文件，不是完整 ASAR；移除注入也不等于恢复整个官方安装包的逐字节副本。
+
+## 给 agent 使用
+
+将 [skill/zcode-speed-repair](skill/zcode-speed-repair/) 整个目录复制到 agent 的技能目录，即可使用安装、检查和卸载功能；脚本和所需文件都在技能目录内，不需要保留源码仓库。
 
 ## 进一步阅读
 
-- [维护文档](docs/maintenance.md)：命令、状态文件、排错、新版本适配与开发验证。
 - [AGENTS.md](AGENTS.md)：仓库职责划分与修改约束。
-- [修复技能](skill/zcode-speed-repair/SKILL.md)：供 agent 执行安装、修复、卸载和版本适配。
+- [修复技能](skill/zcode-speed-repair/SKILL.md)：供 agent 执行安装、更新、检查和卸载。
