@@ -56,7 +56,6 @@ const hooks = {
 };
 
 function setRuntime(dir) { RUNTIME = path.resolve(dir); }
-function runtime() { return RUNTIME; }
 
 function sha(data) {
   return crypto.createHash("sha256").update(data).digest("hex");
@@ -123,9 +122,8 @@ function loadTargets(targetsPath, required = true) {
     if (required) throw new Error(`Version registry ${targetsPath} is missing; run add-version first`);
     return {};
   }
-  const entries = Object.values(data);
   if (typeof data !== "object" || Array.isArray(data) ||
-      entries.some(value => typeof value !== "object" || value === null || Array.isArray(value))) {
+      Object.values(data).some(value => typeof value !== "object" || value === null || Array.isArray(value))) {
     if (required) throw new Error(`Version registry ${targetsPath} is corrupt`);
     return {};
   }
@@ -159,9 +157,8 @@ function fileSha(target) {
 }
 
 function asset(name) {
-  // The deployed runtime copy when present, else the source next to this script.
-  const deployed = path.join(RUNTIME, name);
-  return fs.existsSync(deployed) && fs.statSync(deployed).isFile() ? deployed : path.join(SRC, name);
+  // The bundled source is the only baseline; deploy() keeps the runtime copies equal to it.
+  return path.join(SRC, name);
 }
 
 function deploy() {
@@ -348,7 +345,7 @@ function serializeJsonWithStamp(meta) {
   if (!Array.isArray(stampValues) || stampValues.length !== 3 ||
       !stampValues.every(value => typeof value === "bigint"))
     throw new Error("originalStamp must be three integers");
-  let text = JSON.stringify({ ...meta, originalStamp: ["@@0@@", "@@1@@", "@@2@@" ] }, null, 2);
+  let text = JSON.stringify({ ...meta, originalStamp: ["@@0@@", "@@1@@", "@@2@@"] }, null, 2);
   for (let index = 0; index < 3; index++) {
     const token = `"@@${index}@@"`;
     if (text.split(token).length - 1 !== 1) throw new Error("originalStamp placeholder collision");
@@ -428,9 +425,19 @@ function winQuote(arg) {
   return out + "\\".repeat(backslashes * 2) + '"';
 }
 
-function waiterCommandLine(archive) {
-  return [process.execPath, __filename, "wait", "--asar", String(archive),
-    "--runtime", RUNTIME].map(winQuote).join(" ");
+function waiterArgv(archive, script = __filename) {
+  return [script, "wait", "--asar", String(archive), "--runtime", RUNTIME];
+}
+
+function waiterCommandLine(archive, script = __filename, program = process.execPath) {
+  return [program, ...waiterArgv(archive, script)].map(winQuote).join(" ");
+}
+
+function spawnDetachedWaiter(archive) {
+  const child = spawn(process.execPath, waiterArgv(archive),
+    { stdio: "ignore", windowsHide: true, detached: true });
+  child.unref();
+  return child.pid;
 }
 
 function startWaiterCim(archive) {
@@ -459,25 +466,16 @@ function startWaiterCim(archive) {
 }
 
 function startWaiter(archive) {
-  const options = { stdio: "ignore", windowsHide: true };
   if (process.platform === "win32") {
     try {
       return { pid: startWaiterCim(archive), mode: "cim" };
     } catch (error) {
       // Degraded mode: the waiter stays inside this job tree and may be reaped
       // with it. The pending metadata stays valid; report the manual command.
-      const child = spawn(process.execPath,
-        [__filename, "wait", "--asar", String(archive), "--runtime", RUNTIME],
-        { ...options, detached: true });
-      child.unref();
-      return { pid: child.pid, mode: "detached-fallback", error: error.message };
+      return { pid: spawnDetachedWaiter(archive), mode: "detached-fallback", error: error.message };
     }
   }
-  const child = spawn(process.execPath,
-    [__filename, "wait", "--asar", String(archive), "--runtime", RUNTIME],
-    { ...options, detached: true });
-  child.unref();
-  return { pid: child.pid, mode: "detached" };
+  return { pid: spawnDetachedWaiter(archive), mode: "detached" };
 }
 
 const VERSION_RE =
@@ -576,8 +574,7 @@ function installPlan(fd, nodes, base, targets, version, platform = process.platf
       `${platform} builds must be adapted and registered separately; the ASAR was not changed`);
   const assetPath = entry.asset, expected = entry.assetSha256, registry = entry.registry;
   const oldAsset = readRegisteredAsset(fd, nodes, base, assetPath);
-  const clean = stripBridge(oldAsset.toString("latin1"));
-  const actual = sha(Buffer.from(clean, "latin1"));
+  const [clean, actual] = cleanAsset(oldAsset);
   if (actual !== expected)
     throw new Error(`Renderer fingerprint mismatch; the ASAR was not changed ` +
       `(registered ${expected.slice(0, 12)}, found ${actual.slice(0, 12)})`);
@@ -588,12 +585,16 @@ function installPlan(fd, nodes, base, targets, version, platform = process.platf
   const oldMainText = oldMain.toString("latin1");
   // Already injected counts regardless of the trailing newline older tools left out.
   const found = [...oldMainText.matchAll(LOADER_RE)].map(match => match[0]);
-  const newMain = found.length === 1 && (found[0] === line || found[0] === line + "\n")
-    ? oldMainText
-    : oldMainText.replace(LOADER_RE, "") + line + "\n"; // drop lines from any runtime directory
-  return [assetPath,
-    { [assetPath]: oldAsset, [MAIN]: oldMain },
-    { [assetPath]: clean + "\n" + bridge, [MAIN]: newMain }];
+  const loaderPresent = found.length === 1 && (found[0] === line || found[0] === line + "\n");
+  const wantedAsset = clean + "\n" + bridge;
+  return {
+    assetPath,
+    old: { [assetPath]: oldAsset, [MAIN]: oldMain },
+    wanted: { [assetPath]: wantedAsset,
+      // Loader lines from any runtime directory are dropped first.
+      [MAIN]: loaderPresent ? oldMainText : oldMainText.replace(LOADER_RE, "") + line + "\n" },
+    present: { bridge: oldAsset.equals(Buffer.from(wantedAsset, "latin1")), loader: loaderPresent },
+  };
 }
 
 function removePlan(fd, nodes, base, targets, version, force) {
@@ -602,9 +603,10 @@ function removePlan(fd, nodes, base, targets, version, force) {
   if (entry) {
     assetPath = entry.asset;
     oldAsset = readRegisteredAsset(fd, nodes, base, assetPath);
-    newAsset = stripBridge(oldAsset.toString("latin1"));
-    if (sha(Buffer.from(newAsset, "latin1")) !== entry.assetSha256)
+    const [clean, actual] = cleanAsset(oldAsset);
+    if (actual !== entry.assetSha256)
       throw new Error("Renderer does not match the registered clean fingerprint; the ASAR was not changed");
+    newAsset = clean;
   } else {
     assetPath = scanBridgeAsset(fd, nodes, base);
     if (assetPath !== null && !force)
@@ -618,19 +620,30 @@ function removePlan(fd, nodes, base, targets, version, force) {
   const oldMain = readFileNode(fd, nodes, base, MAIN);
   const oldMainText = oldMain.toString("latin1");
   const old = { [MAIN]: oldMain };
-  const wanted = { [MAIN]: oldMainText.replace(LOADER_RE, "") };
+  const wantedMain = oldMainText.replace(LOADER_RE, "");
+  const wanted = { [MAIN]: wantedMain };
   if (assetPath !== null) {
     old[assetPath] = oldAsset;
     wanted[assetPath] = newAsset;
   }
   // Verified only when a registered fingerprint confirmed the clean result; an
   // unverified --force strip keeps the backups around for manual rollback.
-  const verified = entry != null || assetPath === null;
-  return [assetPath, old, wanted, verified];
+  return {
+    assetPath, old, wanted,
+    verified: entry != null || assetPath === null,
+    present: { bridge: assetPath !== null && oldAsset.toString("latin1") !== newAsset,
+      loader: wantedMain !== oldMainText },
+  };
 }
 
 function stripBridge(text) {
   return text.replace(BRIDGE_RE, "");
+}
+
+function cleanAsset(buffer) {
+  // Registered fingerprints are computed over the bridge-stripped asset text.
+  const text = stripBridge(buffer.toString("latin1"));
+  return [text, sha(Buffer.from(text, "latin1"))];
 }
 
 function syntaxCheck(contents) {
@@ -752,7 +765,7 @@ function verifyRepack(source, destination, changes) {
   }
 }
 
-function apply(archive, intent, version, old, wanted, changes, report, purgeAfter, write) {
+function apply(archive, intent, version, old, changes, report, purgeAfter, write) {
   // Shared install/remove pipeline: backup, repack, verify, replace or pend.
   const originalStamp = stamp(archive);
   const now = new Date();
@@ -770,7 +783,7 @@ function apply(archive, intent, version, old, wanted, changes, report, purgeAfte
     fs.writeFileSync(target, old[name]);
   }
   fs.writeFileSync(path.join(backup, "manifest.json"), serializeJsonWithStamp({
-    intent, asar: String(archive), version, originalStamp,
+    intent, asar: archive, version, originalStamp,
     files: Object.fromEntries(Object.keys(changes).map(name => [name, sha(old[name])])),
   }));
   const [metaPath, pending] = pendingPaths(archive);
@@ -786,21 +799,20 @@ function apply(archive, intent, version, old, wanted, changes, report, purgeAfte
     } catch (error) {
       if (error.code !== "EPERM" && error.code !== "EBUSY") throw error;
       const metadata = {
-        intent, version, asar: String(archive), runtime: RUNTIME,
-        originalStamp, pending: String(pending), sha256: fileSha(pending),
-        verifiedFiles: checked, backup: String(backup), purge: purgeAfter,
+        intent, version, asar: archive, runtime: RUNTIME,
+        originalStamp, pending, sha256: fileSha(pending),
+        verifiedFiles: checked, backup, purge: purgeAfter,
       };
       fs.writeFileSync(metaPath, serializeJsonWithStamp(metadata));
       keepPending = true;
-      saveStatus({ state: "pending", intent, version, verifiedFiles: checked, backup: String(backup) });
+      saveStatus({ state: "pending", intent, version, verifiedFiles: checked, backup });
       const waiter = hooks.spawnWaiter(archive);
-      const waiterPid = typeof waiter === "number" ? waiter : waiter.pid;
-      const waiterMode = typeof waiter === "object" && waiter !== null ? waiter.mode : undefined;
-      const manualContinue = `node "${path.join(RUNTIME, "repair-speed.cjs")}" wait --asar "${archive}" --runtime "${RUNTIME}"`;
+      // The manual command deliberately targets the runtime copy, which outlives this process.
+      const manualContinue = waiterCommandLine(archive, path.join(RUNTIME, "repair-speed.cjs"), "node");
       Object.assign(report, { state: "pending-until-ZCode-exits", intent,
-        verifiedFiles: checked, backup: String(backup), monitorPid: waiterPid, pending: true,
-        waiter: waiterMode || "default", manualContinue });
-      if (waiterMode === "detached-fallback") {
+        verifiedFiles: checked, backup, monitorPid: waiter.pid, pending: true,
+        waiter: waiter.mode || "default", manualContinue });
+      if (waiter.mode === "detached-fallback") {
         report.waiterError = waiter.error;
         report.waiterWarning = "the waiter could not leave the current job tree; if this tool's " +
           "process group is reaped before ZCode exits, run manualContinue yourself";
@@ -813,13 +825,13 @@ function apply(archive, intent, version, old, wanted, changes, report, purgeAfte
   } finally {
     if (!keepPending) fs.rmSync(pending, { force: true });
   }
-  const final = FINAL_STATE[intent];
-  saveStatus({ state: final, version, verifiedFiles: checked, backup: String(backup), restartRequired: true });
-  report.bridge = intent === "install";
-  report.loader = intent === "install";
+  const finalState = { state: FINAL_STATE[intent], version, verifiedFiles: checked, backup,
+    restartRequired: true };
+  saveStatus(finalState);
+  report.bridge = report.loader = intent === "install";
   if (purgeAfter !== null && purgeAfter !== undefined)
     report.runtimeDir = purgeRuntime(purgeAfter.keepBackups);
-  Object.assign(report, { state: final, verifiedFiles: checked, backup: String(backup), restartRequired: true });
+  Object.assign(report, finalState);
   write(JSON.stringify(report, null, 2) + "\n");
   return 0;
 }
@@ -847,7 +859,7 @@ function addVersion(archive, args, write) {
     let assetPath = args.asset;
     if (assetPath === undefined || assetPath === null) assetPath = rendererAssets(nodes)[0];
     if (!(assetPath in nodes)) throw new Error(`${assetPath} is not in the archive`);
-    const clean = stripBridge(readFileNode(fd, nodes, base, assetPath).toString("latin1"));
+    const [clean, assetSha256] = cleanAsset(readFileNode(fd, nodes, base, assetPath));
     const missing = FEATURES.filter(feature => !clean.includes(feature));
     if (missing.length)
       throw new Error(`${assetPath} lacks the store shape the bridge reads ` +
@@ -858,7 +870,7 @@ function addVersion(archive, args, write) {
       throw new Error(`${version} is already registered; re-run with --force to overwrite`);
     targets[version] = {
       asset: assetPath,
-      assetSha256: sha(Buffer.from(clean, "latin1")),
+      assetSha256,
       main: MAIN,
       mainSha256: sha(Buffer.from(mainClean, "latin1")),
       registry: args.registry,
@@ -868,7 +880,7 @@ function addVersion(archive, args, write) {
     fs.writeFileSync(args.targets || TARGETS_PATH, JSON.stringify(sorted, null, 2) + "\n");
     write(JSON.stringify({
       registered: version, targets: String(args.targets || TARGETS_PATH), asset: assetPath,
-      assetSha256: targets[version].assetSha256,
+      assetSha256,
       mainSha256: targets[version].mainSha256, registry: args.registry,
       platform: process.platform, featureContext: contextSnippets(clean),
     }, null, 2) + "\n");
@@ -927,14 +939,14 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
         minimumVersion: MIN_ZCODE_VERSION_TEXT, asar: archive, message: error.message }, null, 2) + "\n");
       return 1;
     }
-    if (args.command === "deploy") {
+    if (args.command !== "check") {
+      // deploy, install and remove all refuse to race a pending replacement.
       ensureNoPending(archive);
-      write(JSON.stringify({ version, asar: archive, source: SRC, runtime: RUNTIME,
-        deployed: deploy() }, null, 2) + "\n");
-      return 0;
-    }
-    if (args.command === "install" || args.command === "remove") {
-      ensureNoPending(archive);
+      if (args.command === "deploy") {
+        write(JSON.stringify({ version, asar: archive, source: SRC, runtime: RUNTIME,
+          deployed: deploy() }, null, 2) + "\n");
+        return 0;
+      }
       deployed = deploy();
     }
     const targets = loadTargets(args.targets || TARGETS_PATH, args.command !== "remove");
@@ -943,21 +955,19 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
   } finally {
     fs.closeSync(fd);
   }
-  const [assetPath, old, wanted, verified = true] = plan;
+  const { old, wanted, present, verified = true } = plan;
   const wantedBytes = Object.fromEntries(Object.entries(wanted).map(([name, data]) =>
     [name, Buffer.isBuffer(data) ? data : Buffer.from(data, "latin1")]));
   const changes = Object.fromEntries(Object.keys(wanted)
     .filter(name => !old[name].equals(wantedBytes[name]))
     .map(name => [name, wantedBytes[name]]));
-  syntaxCheck({ ...wantedBytes, "inject-main.cjs": fs.readFileSync(asset("inject-main.cjs")) });
-  const report = { version, asar: archive, runtime: RUNTIME, syntax: "ok" };
+  const report = { version, asar: archive, runtime: RUNTIME };
   if (deployed.length) report.deployed = deployed;
-  if (args.command === "remove") {
-    report.bridge = assetPath !== null && !old[assetPath].equals(wantedBytes[assetPath]);
-    report.loader = !old[MAIN].equals(wantedBytes[MAIN]);
-  } else {
-    report.bridge = assetPath !== null && old[assetPath].equals(wantedBytes[assetPath]);
-    report.loader = old[MAIN].equals(wantedBytes[MAIN]);
+  report.bridge = present.bridge;
+  report.loader = present.loader;
+  if (Object.keys(changes).length) { // bytes that are never written skip the child-process check
+    syntaxCheck({ ...wantedBytes, "inject-main.cjs": fs.readFileSync(asset("inject-main.cjs")) });
+    report.syntax = "ok";
   }
   if (args.command === "check") {
     const [metaPath, pending] = pendingPaths(archive);
@@ -978,20 +988,20 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
     return 0;
   }
   const purgeAfter = args.command === "remove" ? { keepBackups: !verified } : null;
-  return apply(archive, args.command, version, old, wantedBytes, changes, report, purgeAfter, write);
+  return apply(archive, args.command, version, old, changes, report, purgeAfter, write);
 }
 
 module.exports = {
   BLOCK, BRIDGE_RE, ESSENTIAL_FILES, FEATURES, FINAL_STATE, LOADER_RE, MAIN, MIN_ZCODE_VERSION,
   MIN_ZCODE_VERSION_TEXT, RUNTIME_FILES, TARGETS_PATH,
-  hooks, runtime, setRuntime,
+  hooks, setRuntime,
   sha, readHeader, listFiles, readFileNode, loadTargets, stamp, stampEquals, fileSha, asset, deploy,
   parseRegistryExport, registryInstallRoots, installRootsFor, asarInRoot, looksLikeZCodeRoot,
   findZcodeAsar, installationRoot, saveStatus, purgeRuntime, pendingPaths,
   parseMeta, serializeJsonWithStamp, ensureNoPending, waitForUnlock,
-  winQuote, waiterCommandLine, startWaiterCim, startWaiter,
+  winQuote, waiterArgv, waiterCommandLine, spawnDetachedWaiter, startWaiterCim, startWaiter,
   readVersion, requireSupportedVersion, rendererAssets, scanBridgeAsset, readRegisteredAsset,
-  toFileUri, loaderLine, installPlan, removePlan, stripBridge, syntaxCheck, integrity, repack,
+  toFileUri, loaderLine, installPlan, removePlan, stripBridge, cleanAsset, syntaxCheck, integrity, repack,
   verifyRepack, apply, contextSnippets, addVersion, parseArgs, main,
 };
 

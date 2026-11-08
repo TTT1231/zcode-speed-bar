@@ -6,6 +6,16 @@
   const generations = new WeakMap(), counts = new WeakMap(), childLeases = new Map();
   const MAX_CHILD_LEASES = 64;
   let nextGeneration = 0;
+  function codePoints(text, from = 0) {
+    let length = 0;
+    for (let index = from; index < text.length; index++) {
+      // A high surrogate paired with a low surrogate is one code point.
+      if ((text.charCodeAt(index) & 0xFC00) === 0xD800 &&
+          (text.charCodeAt(index + 1) & 0xFC00) === 0xDC00) index++;
+      length++;
+    }
+    return length;
+  }
   function characters(row) {
     const text = row.kind === "assistantText" || row.kind === "reasoning" ? row.text
       : row.kind === "toolCall" ? row.inputText : "";
@@ -13,18 +23,22 @@
     const cached = counts.get(row);
     if (cached && cached.text === text) return cached.length;
     const previous = cached && cached.text;
-    let length = 0;
+    let length;
     // Streaming appends dominate; count only the new tail instead of rescanning the text.
     if (previous && text.length > previous.length && text.startsWith(previous) &&
         (previous.charCodeAt(previous.length - 1) & 0xFC00) !== 0xD800) {
-      for (const _ of text.slice(previous.length)) length++;
-      length += cached.length;
+      length = cached.length + codePoints(text, previous.length);
     } else {
-      for (const _ of text) length++;
+      length = codePoints(text);
     }
     counts.set(row, { text, length });
     return length;
   }
+  // The only element satisfying match, or null when none or several match.
+  const sole = (list, match) => {
+    const found = list.filter(match);
+    return found.length === 1 ? found[0] : null;
+  };
   function agentLinks(rows) {
     const calls = rows.filter(row => row.kind === "toolCall" &&
       typeof row.toolCallId === "string" && typeof row.turnId === "string");
@@ -36,12 +50,12 @@
     for (let i = 0; i < calls.length; i++) {
       const call = calls[i];
       const sameCall = calls.filter(row => row.turnId === call.turnId && row.toolCallId === call.toolCallId);
-      const matching = children.filter(row => row.turnId === call.turnId && row.parentToolCallId === call.toolCallId);
-      if (sameCall.length === 1 && matching.length === 1 &&
-          children.filter(row => row.childSessionId === matching[0].childSessionId).length === 1) {
-        links[i].childSessionId = matching[0].childSessionId;
-        links[i].status = matching[0].status;
-        claimed.add(matching[0]);
+      const child = sole(children, row => row.turnId === call.turnId && row.parentToolCallId === call.toolCallId);
+      if (sameCall.length === 1 && child &&
+          sole(children, row => row.childSessionId === child.childSessionId) === child) {
+        links[i].childSessionId = child.childSessionId;
+        links[i].status = child.status;
+        claimed.add(child);
       }
     }
     // Match ZCode's unambiguous single-agent fallback when no parent ID was supplied.
@@ -51,13 +65,13 @@
       if (links[i].childSessionId) continue;
       if (!["Agent", "Task", "subagent"].includes(call.toolName)) continue;
       const unlinked = calls.filter((row, index) => row.turnId === call.turnId && !links[index].childSessionId);
-      const orphans = children.filter(row => row.turnId === call.turnId && !row.parentToolCallId && !claimed.has(row));
+      const orphan = sole(children, row => row.turnId === call.turnId && !row.parentToolCallId && !claimed.has(row));
       const conflicting = children.some(row => row.turnId === call.turnId && row.parentToolCallId === call.toolCallId);
-      if (!conflicting && unlinked.length === 1 && orphans.length === 1 &&
-          children.filter(row => row.childSessionId === orphans[0].childSessionId).length === 1) {
-        links[i].childSessionId = orphans[0].childSessionId;
-        links[i].status = orphans[0].status;
-        claimed.add(orphans[0]);
+      if (!conflicting && unlinked.length === 1 && orphan &&
+          sole(children, row => row.childSessionId === orphan.childSessionId) === orphan) {
+        links[i].childSessionId = orphan.childSessionId;
+        links[i].status = orphan.status;
+        claimed.add(orphan);
       }
     }
     return links;

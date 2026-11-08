@@ -22,7 +22,8 @@ function createSpeedMeter(singleStream = false) {
         for (const entry of streams.values()) entry.meter.suspend();
         return { mode: "unavailable", tps: null };
       }
-      const key = JSON.stringify([snapshot.sessionId, snapshot.epoch, snapshot.generation, snapshot.connectionGeneration]);
+      const key = [snapshot.sessionId, snapshot.epoch, snapshot.generation,
+        snapshot.connectionGeneration].join("\u0000");
       const entry = streams.get(key) || { sid: snapshot.sessionId, meter: createSpeedMeter(true) };
       streams.delete(key);
       entry.at = now;
@@ -32,18 +33,21 @@ function createSpeedMeter(singleStream = false) {
       while (streams.size > 128) streams.delete(streams.keys().next().value);
       return result;
     }
-    function sampleAll(snapshots, now) {
-      active.clear();
-      const unique = new Map();
+    function bySessionId(snapshots) {
+      // One snapshot per conversation; a session seen from two stores is unusable.
+      const bySession = new Map();
       for (const snapshot of snapshots) {
         if (!snapshot || typeof snapshot.sessionId !== "string" || !Array.isArray(snapshot.rows)) continue;
-        if (unique.has(snapshot.sessionId)) unique.set(snapshot.sessionId, null);
-        else unique.set(snapshot.sessionId, snapshot);
+        bySession.set(snapshot.sessionId, bySession.has(snapshot.sessionId) ? null : snapshot);
       }
-      for (const [sid, snapshot] of unique) if (snapshot) active.set(sid, update(snapshot, now));
+      return bySession;
+    }
+    function sampleAll(snapshots, now) {
+      active.clear();
+      for (const [sid, snapshot] of bySessionId(snapshots)) if (snapshot) active.set(sid, update(snapshot, now));
     }
     return {
-      update, sampleAll,
+      update, sampleAll, bySessionId,
       get: sid => active.get(sid) || { sessionId: sid || "", mode: "unavailable", tps: null },
       sessionIds: () => [...new Set(Array.from(streams.values(), entry => entry.sid))],
       reset() { streams.clear(); active.clear(); }
@@ -64,7 +68,7 @@ function createSpeedMeter(singleStream = false) {
   }
   function update(snapshot, now) {
     if (!snapshot || !Array.isArray(snapshot.rows)) { reset(); return { mode: "unavailable", tps: null }; }
-    const nextIdentity = JSON.stringify([snapshot.sessionId, snapshot.epoch, snapshot.generation]);
+    const nextIdentity = [snapshot.sessionId, snapshot.epoch, snapshot.generation].join("\u0000");
     if (nextIdentity !== identity) { reset(); identity = nextIdentity; }
     if (snapshot.projectionReady === false || (snapshot.status && snapshot.status !== "live")) {
       suspend();
@@ -166,6 +170,8 @@ function rendererMain(makeMeter, version) {
         ? Math.max(0, paneWidth / 2 - barWidth / 2 - 8) : null;
     } catch (_) { return null; }
   }
+  // The host's pane contract, in one place.
+  const PANE_SELECTOR = '[data-testid^="v4-session-pane-"][data-session-id]';
   function roleOf(pane) {
     return pane.getAttribute("data-testid") === "v4-session-pane-workspace-main" ? "main" : "side";
   }
@@ -216,8 +222,7 @@ function rendererMain(makeMeter, version) {
     return rect.width > 0 && rect.height > 0;
   }
   function paneOf(element) {
-    return element && typeof element.closest === "function"
-      ? element.closest('[data-testid^="v4-session-pane-"][data-session-id]') : null;
+    return element && typeof element.closest === "function" ? element.closest(PANE_SELECTOR) : null;
   }
   function rememberPane(event) {
     const pane = paneOf(event.target);
@@ -227,7 +232,7 @@ function rendererMain(makeMeter, version) {
     const focused = paneOf(document.activeElement);
     if (panes.includes(focused)) return focused;
     if (panes.includes(lastPane)) return lastPane;
-    return panes.find(pane => pane.getAttribute("data-testid") === "v4-session-pane-workspace-main") || panes[0] || null;
+    return panes.find(pane => roleOf(pane) === "main") || panes[0] || null;
   }
   function ensure(pane) {
     const existing = bars.get(pane);
@@ -312,14 +317,14 @@ function rendererMain(makeMeter, version) {
     const ready = snapshot.projectionReady !== false && (!snapshot.status || snapshot.status === "live");
     const byRow = new Map();
     for (const agent of snapshot.agents) {
-      const key = JSON.stringify([String(agent.rowId), agent.toolCallId]);
+      const key = agent.rowId + "|" + agent.toolCallId;
       byRow.set(key, byRow.has(key) ? null : agent);
     }
     if (!byRow.size) return;  // Without agents even scanning tool blocks is wasted work.
     for (const block of pane.querySelectorAll('[data-tool-call-id][data-tool-name]')) {
       if (paneOf(block) !== pane) continue;
       const row = block.closest('[data-row-id]');
-      const agent = row && byRow.get(JSON.stringify([row.getAttribute("data-row-id"), block.getAttribute("data-tool-call-id")]));
+      const agent = row && byRow.get(row.getAttribute("data-row-id") + "|" + block.getAttribute("data-tool-call-id"));
       if (!agent) continue;
       const summary = Array.from(block.querySelectorAll('[data-testid^="tool-summary-trigger-"], [data-testid^="v4-subagent-open-side-pane-"]'))
         .find(element => element.closest('[data-tool-call-id]') === block);
@@ -340,7 +345,7 @@ function rendererMain(makeMeter, version) {
     }
   }
   function tick() {
-    const panes = Array.from(document.querySelectorAll('[data-testid^="v4-session-pane-"][data-session-id]')).filter(visible);
+    const panes = Array.from(document.querySelectorAll(PANE_SELECTOR)).filter(visible);
     const pane = pickPane(panes);
     const sid = pane && pane.getAttribute("data-session-id");
     const hasBridge = typeof window.__ZSPEED_READ__ === "function";
@@ -356,12 +361,10 @@ function rendererMain(makeMeter, version) {
       snapshots = Array.from(known, sessionId => window.__ZSPEED_READ__(sessionId)).filter(Boolean);
     }
     meter.sampleAll(snapshots, performance.now());
-    const bySession = new Map();
-    for (const snapshot of snapshots) if (snapshot && typeof snapshot.sessionId === "string") {
-      bySession.set(snapshot.sessionId, bySession.has(snapshot.sessionId) ? null : snapshot);
-    }
+    const bySession = meter.bySessionId(snapshots);
+    const paneSet = new Set(panes);
     for (const [pane, entry] of bars) {
-      if (!panes.includes(pane)) { entry.bar.remove(); bars.delete(pane); }
+      if (!paneSet.has(pane)) { entry.bar.remove(); bars.delete(pane); }
     }
     const theme = document.documentElement.classList.contains("dark") ? "dark" : "light";
     const seenAgents = new Set();
@@ -423,7 +426,10 @@ function install() {
   // Constant per install(); rebuilding it every tick would churn ~15KB of strings.
   const js = "window.__ZSPEED_VERSION__ === " + JSON.stringify(VERSION)
     + " && typeof window.__ZSPEED_TICK__ === 'function' ? window.__ZSPEED_TICK__() : " + source;
-  const hooks = new Map(), pending = new Map(), states = new Map();
+  // Steady state only drives the already-injected bar; the full payload crosses
+  // IPC again only after a load, or a tick that finds no bar to drive.
+  const probe = "window.__ZSPEED_TICK__ ? window.__ZSPEED_TICK__() : null";
+  const hooks = new Map(), pending = new Map(), states = new Map(), live = new Set();
   let lastStatus = 0, lastError = "", stopped = false;
   function log(message) {
     fs.appendFile(path.join(__dirname, "debug.log"), "[" + new Date().toISOString() + "] " + message + "\n", () => {});
@@ -440,16 +446,18 @@ function install() {
     const now = Date.now();
     if (pending.has(wc.id) && now - pending.get(wc.id) < 2000) return;
     pending.set(wc.id, now);
-    Promise.resolve().then(() => wc.executeJavaScript(js, false)).then(state => {
-      if (state) states.set(wc.id, state);
+    Promise.resolve().then(() => wc.executeJavaScript(live.has(wc.id) ? probe : js, false)).then(state => {
+      if (state) { states.set(wc.id, state); live.add(wc.id); }
+      else live.delete(wc.id);
     }).catch(error => {
+      live.delete(wc.id);
       if (error.message !== lastError) { lastError = error.message; log("renderer: " + lastError); }
     }).finally(() => { if (pending.get(wc.id) === now) pending.delete(wc.id); });
   }
   function hook(wc) {
     if (hooks.has(wc)) return;
-    const refresh = () => tickWindow(wc);
-    const closed = () => { hooks.delete(wc); pending.delete(wc.id); states.delete(wc.id); };
+    const refresh = () => { live.delete(wc.id); tickWindow(wc); }; // a load may have wiped the bar
+    const closed = () => { hooks.delete(wc); pending.delete(wc.id); states.delete(wc.id); live.delete(wc.id); };
     hooks.set(wc, { refresh, closed });
     wc.on("dom-ready", refresh); wc.on("did-finish-load", refresh); wc.once("destroyed", closed);
     tickWindow(wc);
@@ -476,7 +484,7 @@ function install() {
       wc.removeListener("dom-ready", handlers.refresh); wc.removeListener("did-finish-load", handlers.refresh);
       wc.removeListener("destroyed", handlers.closed);
     }
-    hooks.clear(); pending.clear(); states.clear();
+    hooks.clear(); pending.clear(); states.clear(); live.clear();
     delete globalThis.__ZSPEED_LOADED__; delete globalThis.__ZSPEED_MAIN_DISPOSE__;
   }
   globalThis.__ZSPEED_MAIN_DISPOSE__ = dispose;

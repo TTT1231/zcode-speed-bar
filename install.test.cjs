@@ -141,9 +141,9 @@ function fixture(t) {
   return { root, skill, targets, home, runtime, installation, archive };
 }
 
-function cli(f, command, extraArgs = [], expected = 0) {
-  const result = spawnSync(process.execPath, [path.join(f.skill, "scripts", "repair-speed.cjs"),
-    command, "--asar", f.archive, ...extraArgs], {
+function cli(f, command, extraArgs = [], expected = 0,
+    script = path.join(f.skill, "scripts", "repair-speed.cjs")) {
+  const result = spawnSync(process.execPath, [script, command, "--asar", f.archive, ...extraArgs], {
     cwd: f.root,
     env: { ...process.env, HOME: f.home, USERPROFILE: f.home },
     encoding: "utf8",
@@ -163,7 +163,7 @@ function startPending(f, command) {
   mod.hooks.replaceFile = () => {
     throw Object.assign(new Error("simulated lock"), { code: "EPERM" });
   };
-  mod.hooks.spawnWaiter = () => 1234;
+  mod.hooks.spawnWaiter = () => ({ pid: 1234, mode: "test" });
   const code = mod.main([command, "--asar", f.archive], text => { output += text; });
   assert.strictEqual(code, 0, output);
   return [mod, JSON.parse(output), () => {
@@ -334,13 +334,7 @@ test("removal can clean an older version", t => {
 
 test("root compatibility entry installs with explicit targets", t => {
   const f = fixture(t);
-  const result = spawnSync(process.execPath, [ROOT_ENTRY, "install", "--asar", f.archive,
-    "--targets", f.targets], {
-    cwd: f.root,
-    env: { ...process.env, HOME: f.home, USERPROFILE: f.home },
-    encoding: "utf8",
-  });
-  assert.strictEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const result = cli(f, "install", ["--targets", f.targets], 0, ROOT_ENTRY);
   assert.strictEqual(JSON.parse(result.stdout).state, "installed");
   assert.ok(unpackAsar(f.archive)[ASSET].includes("zspeed-bridge:v1 begin"));
 });
@@ -441,12 +435,7 @@ test("removal from the runtime directory preserves its own files", t => {
   const f = fixture(t);
   cli(f, "install");
   const runtimeScript = path.join(f.runtime, "repair-speed.cjs");
-  const result = spawnSync(process.execPath, [runtimeScript, "remove", "--asar", f.archive], {
-    cwd: f.root,
-    env: { ...process.env, HOME: f.home, USERPROFILE: f.home },
-    encoding: "utf8",
-  });
-  assert.strictEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const result = cli(f, "remove", [], 0, runtimeScript);
   assert.ok(JSON.parse(result.stdout).runtimeDir.includes("kept: this script runs inside it"));
   assertArchiveEquals(f.archive, ORIGINAL);
   assert.strictEqual(fs.existsSync(runtimeScript), true);
