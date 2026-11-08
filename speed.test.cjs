@@ -6,11 +6,13 @@ const path = require("node:path");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 const sourceDir = path.join(__dirname, "skill", "zcode-speed-repair", "scripts");
-const { createSpeedMeter, rendererMain, VERSION } = require(path.join(sourceDir, "inject-main.cjs"));
+const { createSpeedMeter, rendererSource, VERSION } = require(path.join(sourceDir, "inject-main.cjs"));
 const head = (extra = {}) => ({ id: 1, turnId: "t1", kind: "turnHeader", state: "running", chars: 0, ...extra });
 const text = (chars, extra = {}) => ({ id: 2, turnId: "t1", kind: "assistantText", chars, ...extra });
 const snap = (chars, extra = {}) => ({ sessionId: "s1", epoch: "e1", generation: 1, phase: "running",
   rows: [head(), text(chars)], ...extra });
+const pointer = (clientX, pointerId = 1) => ({ clientX, pointerId, isPrimary: true, preventDefault() {}, stopPropagation() {} });
+const fire = (el, name, event) => el.listeners.get(name)(event);
 
 test("speed updates every 500ms from live snapshots without any DB event", () => {
   const meter = createSpeedMeter();
@@ -293,6 +295,17 @@ test("bridge never guesses between multiple unmatched or conflicting agent calls
   assert.deepEqual(leases.released, ["child-a", "child-b"]);
 });
 
+test("exact parent-ID matching does not depend on the tool name", () => {
+  const f = bridgeFixture(), rows = f.snapshot.rows.window;
+  rows.push(
+    { rowId: 10, turnId: "t1", kind: "toolCall", toolName: "CustomSpawn", toolCallId: "call-x" },
+    { rowId: 20, turnId: "t1", kind: "subagent", parentToolCallId: "call-x", childSessionId: "child-x", status: "running" }
+  );
+  childStores(f, new Map([["child-x", childSnapshot("child-x")]]));
+  const agents = f.context.__ZSPEED_READ__("s1").agents;
+  assert.deepEqual(Array.from(agents, a => a.childSessionId), ["child-x"]);
+});
+
 test("child subscriptions follow a parent reconnect and are bounded in favor of running agents", () => {
   const f = bridgeFixture(), rows = f.snapshot.rows.window;
   const children = new Map();
@@ -389,10 +402,18 @@ function rendererFixture() {
     }
   };
   const context = vm.createContext({ window, document, performance: { now: () => now } });
-  const source = "(" + rendererMain.toString() + ")(" + createSpeedMeter.toString() + "," + JSON.stringify(VERSION) + ")";
+  const source = rendererSource();
   return { context, window, document, body, pane, bridge, source, listeners, addPane, Element, store,
     barFor: pane => pane.children.find(element => element.className === "zusage-speed-mini"),
     setNow: time => { now = time; } };
+}
+
+// Registers a cloned second conversation on the bridge; paneId also gives it its own pane.
+function addConversation(f, sid, paneId) {
+  const snapshot = structuredClone(f.bridge.snapshot);
+  snapshot.sessionId = sid;
+  f.bridge.entry.layer.entries.set("session:" + sid, { store: { getState: () => ({ snapshot }) } });
+  return { snapshot, pane: paneId ? f.addPane(sid, paneId) : null };
 }
 
 test("renderer keeps one speed-only capsule per chat, updates in place and cleans up", () => {
@@ -422,8 +443,6 @@ test("the speed capsule drags horizontally, keeps its place per run and recenter
   f.store.set("zspeed-bar-offset", "50");
   vm.runInContext(f.source, f.context);
   assert.equal(f.store.has("zspeed-bar-offset"), false);
-  const pointer = clientX => ({ clientX, pointerId: 7, isPrimary: true, preventDefault() {}, stopPropagation() {} });
-  const fire = (el, name, event) => el.listeners.get(name)(event);
   const capsule = f.barFor(f.pane);
   assert.equal(capsule.style.transform, "translateX(calc(-50% + 0px))");
   assert.ok(capsule.title.includes("可左右拖动，双击复位"));
@@ -454,8 +473,6 @@ test("side and main panes drag their bars independently", () => {
   const f = rendererFixture();
   const side = f.addPane("s2", "workspace-side-1");
   vm.runInContext(f.source, f.context);
-  const pointer = clientX => ({ clientX, pointerId: 1, isPrimary: true, preventDefault() {}, stopPropagation() {} });
-  const fire = (el, name, event) => el.listeners.get(name)(event);
   const mainBar = f.barFor(f.pane), sideBar = f.barFor(side);
   fire(sideBar, "pointerdown", pointer(250));
   fire(sideBar, "pointermove", pointer(350));
@@ -506,8 +523,8 @@ test("three subagents show their own live, waiting and final rates beside the co
   f.window.__ZSPEED_TICK__();
   assert.equal(f.barFor(f.pane).children[1].textContent, "100.0");
   assert.deepEqual(summaries.map(summary => summary.children[0].textContent), ["80.0 t/s", "45.0 t/s", "0.0 t/s"]);
-  assert.equal(summaries[0].children[0].style.color, "#087b53");
-  assert.equal(summaries[1].children[0].style.color, "#896008");
+  assert.equal(summaries[0].children[0].getAttribute("data-speed-band"), "fast");
+  assert.equal(summaries[1].children[0].getAttribute("data-speed-band"), "medium");
   rows[1].state = "completed";
   const finished = children.get("child-b");
   finished.control.phase = "completedSuccess";
@@ -535,9 +552,7 @@ test("three subagents show their own live, waiting and final rates beside the co
 
 test("A to B to A keeps independent live speeds while both conversations generate", () => {
   const f = rendererFixture();
-  const other = structuredClone(f.bridge.snapshot);
-  other.sessionId = "s2";
-  f.bridge.entry.layer.entries.set("session:s2", { store: { getState: () => ({ snapshot: other }) } });
+  const other = addConversation(f, "s2").snapshot;
   vm.runInContext(f.source, f.context);
   for (const [now, sid, expected] of [[500, "s1", 100], [1000, "s2", 200], [1500, "s1", 100], [2000, "s2", 200]]) {
     f.setNow(now);
@@ -552,10 +567,8 @@ test("A to B to A keeps independent live speeds while both conversations generat
 
 test("main and auxiliary chats run in parallel and keep their own bars after the main chat finishes", () => {
   const f = rendererFixture();
-  const auxiliary = structuredClone(f.bridge.snapshot);
-  auxiliary.sessionId = "child";
-  f.bridge.entry.layer.entries.set("session:child", { store: { getState: () => ({ snapshot: auxiliary }) } });
-  const auxiliaryPane = f.addPane("child", "selection-side-chat:workspace:s1:child");
+  const { snapshot: auxiliary, pane: auxiliaryPane } =
+    addConversation(f, "child", "selection-side-chat:workspace:s1:child");
   vm.runInContext(f.source, f.context);
   const mainBar = f.barFor(f.pane), auxiliaryBar = f.barFor(auxiliaryPane);
   assert.ok(mainBar, "the main chat must own its bar");
@@ -580,10 +593,8 @@ test("main and auxiliary chats run in parallel and keep their own bars after the
 
 test("an auxiliary chat can finish while the main chat keeps generating independently", () => {
   const f = rendererFixture();
-  const auxiliary = structuredClone(f.bridge.snapshot);
-  auxiliary.sessionId = "child";
-  f.bridge.entry.layer.entries.set("session:child", { store: { getState: () => ({ snapshot: auxiliary }) } });
-  const auxiliaryPane = f.addPane("child", "selection-side-chat:workspace:s1:child");
+  const { snapshot: auxiliary, pane: auxiliaryPane } =
+    addConversation(f, "child", "selection-side-chat:workspace:s1:child");
   vm.runInContext(f.source, f.context);
   for (const now of [500, 1000, 1500, 2000]) {
     f.setNow(now);
@@ -602,10 +613,8 @@ test("an auxiliary chat can finish while the main chat keeps generating independ
 
 test("auxiliary bars follow tab visibility and closing without replacing the main bar", () => {
   const f = rendererFixture();
-  const auxiliary = structuredClone(f.bridge.snapshot);
-  auxiliary.sessionId = "child";
-  f.bridge.entry.layer.entries.set("session:child", { store: { getState: () => ({ snapshot: auxiliary }) } });
-  const auxiliaryPane = f.addPane("child", "selection-side-chat:workspace:s1:child");
+  const { snapshot: auxiliary, pane: auxiliaryPane } =
+    addConversation(f, "child", "selection-side-chat:workspace:s1:child");
   vm.runInContext(f.source, f.context);
   const mainBar = f.barFor(f.pane), auxiliaryBar = f.barFor(auxiliaryPane);
   assert.ok(mainBar);
@@ -634,10 +643,8 @@ test("auxiliary bars follow tab visibility and closing without replacing the mai
 test("older bridges sample an auxiliary chat before it receives focus", () => {
   const f = rendererFixture();
   delete f.window.__ZSPEED_READ_ALL__;
-  const auxiliary = structuredClone(f.bridge.snapshot);
-  auxiliary.sessionId = "child";
-  f.bridge.entry.layer.entries.set("session:child", { store: { getState: () => ({ snapshot: auxiliary }) } });
-  const auxiliaryPane = f.addPane("child", "selection-side-chat:workspace:s1:child");
+  const { snapshot: auxiliary, pane: auxiliaryPane } =
+    addConversation(f, "child", "selection-side-chat:workspace:s1:child");
   vm.runInContext(f.source, f.context);
   f.setNow(500);
   f.bridge.snapshot.rows.window[1].text += "a".repeat(100);
@@ -668,9 +675,7 @@ test("replacing a renderer version disposes every conversation's old bar", () =>
 test("older bridges keep sampling previously visited conversations", () => {
   const f = rendererFixture();
   delete f.window.__ZSPEED_READ_ALL__;
-  const other = structuredClone(f.bridge.snapshot);
-  other.sessionId = "s2";
-  f.bridge.entry.layer.entries.set("session:s2", { store: { getState: () => ({ snapshot: other }) } });
+  const other = addConversation(f, "s2").snapshot;
   vm.runInContext(f.source, f.context);
   f.pane.attributes["data-session-id"] = "s2";
   f.setNow(500); f.window.__ZSPEED_TICK__();

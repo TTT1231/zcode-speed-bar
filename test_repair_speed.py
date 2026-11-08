@@ -106,11 +106,13 @@ class RepairSpeedTests(unittest.TestCase):
         module.RUNTIME = self.runtime
         return module
 
-    def start_pending_remove(self):
-        self.cli("install")
+    def start_pending(self, command):
+        """Run a command whose archive replacement hits the file lock; returns the script and its report."""
+        if command == "remove":
+            self.cli("install")
         module = self.load_script()
         output = io.StringIO()
-        with mock.patch.object(sys, "argv", [str(self.script), "remove", "--asar", str(self.archive)]), \
+        with mock.patch.object(sys, "argv", [str(self.script), command, "--asar", str(self.archive)]), \
              mock.patch.object(module.os, "replace", side_effect=PermissionError("simulated lock")), \
              mock.patch.object(module, "start_waiter", return_value=1234), \
              contextlib.redirect_stdout(output):
@@ -300,7 +302,7 @@ class RepairSpeedTests(unittest.TestCase):
         self.assertTrue(list((self.runtime / "backups").glob("*-injected-*")))
 
     def test_pending_remove_reports_current_state_and_cleans_only_after_replace(self):
-        module, report = self.start_pending_remove()
+        module, report = self.start_pending("remove")
         self.assertEqual((report["state"], report["pending"]), ("pending-until-ZCode-exits", True))
         self.assertTrue(report["bridge"] and report["loader"])
         self.assertTrue(self.runtime.is_dir())
@@ -314,14 +316,7 @@ class RepairSpeedTests(unittest.TestCase):
         self.assertFalse(self.runtime.exists())
 
     def test_pending_install_reports_current_state_until_replacement(self):
-        module = self.load_script()
-        output = io.StringIO()
-        with mock.patch.object(sys, "argv", [str(self.script), "install", "--asar", str(self.archive)]), \
-             mock.patch.object(module.os, "replace", side_effect=PermissionError("simulated lock")), \
-             mock.patch.object(module, "start_waiter", return_value=1234), \
-             contextlib.redirect_stdout(output):
-            self.assertEqual(module.main(), 0)
-        report = json.loads(output.getvalue())
+        module, report = self.start_pending("install")
         self.assertTrue(report["pending"])
         self.assertFalse(report["bridge"] or report["loader"])
         self.assertEqual(unpack_asar(self.archive), ORIGINAL)
@@ -330,7 +325,7 @@ class RepairSpeedTests(unittest.TestCase):
         self.assertTrue(checked["bridge"] and checked["loader"] and not checked["pending"])
 
     def test_tampered_pending_file_is_not_applied(self):
-        module, _ = self.start_pending_remove()
+        module, _ = self.start_pending("remove")
         before = self.archive.read_bytes()
         pending = self.archive.with_name(self.archive.name + ".zspeed.pending")
         pending.write_bytes(pending.read_bytes() + b"tampered")
@@ -341,7 +336,7 @@ class RepairSpeedTests(unittest.TestCase):
         self.assertTrue(self.runtime.is_dir())
 
     def test_pending_is_cancelled_if_original_archive_changes(self):
-        module, _ = self.start_pending_remove()
+        module, _ = self.start_pending("remove")
         self.archive.write_bytes(self.archive.read_bytes() + b"host updated")
         changed = self.archive.read_bytes()
         self.assertEqual(module.wait_for_unlock(self.archive.resolve()), 1)

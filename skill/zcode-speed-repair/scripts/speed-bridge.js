@@ -12,19 +12,27 @@
     if (typeof text !== "string") return 0;
     const cached = counts.get(row);
     if (cached && cached.text === text) return cached.length;
+    const previous = cached && cached.text;
     let length = 0;
-    for (const _character of text) length++;
+    // Streaming appends dominate; count only the new tail instead of rescanning the text.
+    if (previous && text.length > previous.length && text.startsWith(previous) &&
+        (previous.charCodeAt(previous.length - 1) & 0xFC00) !== 0xD800) {
+      for (const _ of text.slice(previous.length)) length++;
+      length += cached.length;
+    } else {
+      for (const _ of text) length++;
+    }
     counts.set(row, { text, length });
     return length;
   }
   function agentLinks(rows) {
     const calls = rows.filter(row => row.kind === "toolCall" &&
-      ["Agent", "Task", "subagent"].includes(row.toolName) &&
       typeof row.toolCallId === "string" && typeof row.turnId === "string");
     const children = rows.filter(row => row.kind === "subagent" &&
       typeof row.childSessionId === "string" && row.childSessionId && typeof row.turnId === "string");
     const links = calls.map(row => ({ rowId: row.rowId, toolCallId: row.toolCallId }));
     const claimed = new Set();
+    // Exact parent-ID matching needs no tool name: the host writes parentToolCallId itself.
     for (let i = 0; i < calls.length; i++) {
       const call = calls[i];
       const sameCall = calls.filter(row => row.turnId === call.turnId && row.toolCallId === call.toolCallId);
@@ -37,9 +45,11 @@
       }
     }
     // Match ZCode's unambiguous single-agent fallback when no parent ID was supplied.
+    // The heuristic guesses, so it stays restricted to the tools known to spawn agents.
     for (let i = 0; i < calls.length; i++) {
       const call = calls[i];
       if (links[i].childSessionId) continue;
+      if (!["Agent", "Task", "subagent"].includes(call.toolName)) continue;
       const unlinked = calls.filter((row, index) => row.turnId === call.turnId && !links[index].childSessionId);
       const orphans = children.filter(row => row.turnId === call.turnId && !row.parentToolCallId && !claimed.has(row));
       const conflicting = children.some(row => row.turnId === call.turnId && row.parentToolCallId === call.toolCallId);

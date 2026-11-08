@@ -9,7 +9,7 @@
  * Reference: ByteRax/zcode-token-usage-statusbar, renderer bridge for 3.17.1.
  */
 "use strict";
-const VERSION = "store-speed-9";
+const VERSION = "store-speed-10";
 const REFRESH_MS = 500;
 
 // Self-contained: the same calculation runs in Electron and regression tests.
@@ -58,7 +58,7 @@ function createSpeedMeter(singleStream = false) {
   function suspend() { samples = []; observedGrowth = false; lastObserved = null; }
   function reset() {
     identity = ""; turnId = ""; cpt = 2; lengths.clear(); total = 0;
-    samples = []; header = null; completeText = false; calibrated = false;
+    header = null; completeText = false; calibrated = false;
     lastFinal = lastEstimate = null;
     suspend();
   }
@@ -125,7 +125,7 @@ function createSpeedMeter(singleStream = false) {
       if (elapsed < 200 || (!observedGrowth && elapsed < WINDOW_MS)) {
         return { ...result, mode: "warming", est: true, tps: null };
       }
-      const rate = elapsed >= 200 ? Math.max(0, total - first.chars) * 1000 / elapsed / cpt : 0;
+      const rate = Math.max(0, total - first.chars) * 1000 / elapsed / cpt;
       if (rate > 0) lastEstimate = rate;
       return { ...result, mode: "live", est: true, tps: rate };
     }
@@ -170,8 +170,9 @@ function rendererMain(makeMeter, version) {
     return pane.getAttribute("data-testid") === "v4-session-pane-workspace-main" ? "main" : "side";
   }
   function applyOffset(bar, pane) {
-    const limit = offsetLimit(bar, pane);
     const raw = offsets.get(roleOf(pane)) || 0;
+    // A zero offset is always inside the limit; skip the layout reads.
+    const limit = raw === 0 ? 0 : offsetLimit(bar, pane);
     const x = limit === null ? raw : Math.max(-limit, Math.min(limit, raw));
     bar.style.transform = "translateX(calc(-50% + " + x + "px))";
   }
@@ -193,14 +194,13 @@ function rendererMain(makeMeter, version) {
       const finish = e => {
         bar.removeEventListener("pointermove", move);
         bar.removeEventListener("pointerup", finish);
-        bar.removeEventListener("pointercancel", cancel);
+        bar.removeEventListener("pointercancel", finish);
         try { bar.releasePointerCapture(event.pointerId); } catch (_) {}
         if (e && typeof e.stopPropagation === "function") e.stopPropagation();
       };
-      const cancel = e => finish(e);
       bar.addEventListener("pointermove", move);
       bar.addEventListener("pointerup", finish);
-      bar.addEventListener("pointercancel", cancel);
+      bar.addEventListener("pointercancel", finish);
     });
     bar.addEventListener("click", e => e.stopPropagation());
     bar.addEventListener("dblclick", e => {
@@ -244,16 +244,19 @@ function rendererMain(makeMeter, version) {
       + "background:var(--zs-surface);color:var(--zs-text);box-shadow:var(--zs-shadow);"
       + "touch-action:none;user-select:none;white-space:nowrap;font-variant-numeric:tabular-nums;";
     const style = document.createElement("style");
-    style.textContent = ".zusage-speed-mini{--zs-surface:#fff;--zs-text:#202834;--zs-muted:#616b79;"
+    style.textContent = ".zusage-speed-mini,.zspeed-agent-mini{--zs-surface:#fff;--zs-text:#202834;--zs-muted:#616b79;"
       + "--zs-border:rgba(27,37,51,.13);--zs-shadow:0 1px 4px rgba(20,30,45,.08);"
       + "--zs-fast:#087b53;--zs-medium:#896008;--zs-slow:#b73d36}"
-      + '.zusage-speed-mini[data-zspeed-theme="dark"]{--zs-surface:#27292e;--zs-text:#f0f2f5;'
+      + '.zusage-speed-mini[data-zspeed-theme="dark"],.zspeed-agent-mini[data-zspeed-theme="dark"]{--zs-surface:#27292e;--zs-text:#f0f2f5;'
       + "--zs-muted:#adb4c0;--zs-border:rgba(220,227,238,.14);--zs-shadow:0 1px 4px rgba(0,0,0,.14);"
       + "--zs-fast:#56d6a2;--zs-medium:#ebbf63;--zs-slow:#ff988e}"
       + ".zusage-speed-mini [data-tps]{min-width:5ch;text-align:right;transition:color 160ms ease}"
       + '.zusage-speed-mini[data-speed-band="fast"] [data-tps]{color:var(--zs-fast)}'
       + '.zusage-speed-mini[data-speed-band="medium"] [data-tps]{color:var(--zs-medium)}'
       + '.zusage-speed-mini[data-speed-band="slow"] [data-tps]{color:var(--zs-slow)}'
+      + '.zspeed-agent-mini[data-speed-band="fast"]{color:var(--zs-fast)}'
+      + '.zspeed-agent-mini[data-speed-band="medium"]{color:var(--zs-medium)}'
+      + '.zspeed-agent-mini[data-speed-band="slow"]{color:var(--zs-slow)}'
       + ".zusage-speed-mini [data-speed-icon]{display:block;flex:none;width:12px;height:12px;color:var(--zs-muted)}"
       + ".zusage-speed-mini [data-speed-unit]{font:400 11px/16px system-ui,sans-serif;color:var(--zs-muted);margin-left:-2px}"
       + "@media(prefers-reduced-motion:reduce){.zusage-speed-mini [data-tps]{transition:none}}";
@@ -298,7 +301,8 @@ function rendererMain(makeMeter, version) {
     badge.setAttribute("role", "status");
     badge.setAttribute("aria-live", "off");
     badge.style.cssText = "display:inline-block;flex:none;white-space:nowrap;pointer-events:none;user-select:none;"
-      + "font:600 .9em/1.4 var(--font-mono,ui-monospace,Consolas,monospace);font-variant-numeric:tabular-nums";
+      + "font:600 .9em/1.4 var(--font-mono,ui-monospace,Consolas,monospace);font-variant-numeric:tabular-nums;"
+      + "color:var(--zs-muted)";
     summary.appendChild(badge);
     agentBars.set(summary, badge);
     return badge;
@@ -311,6 +315,7 @@ function rendererMain(makeMeter, version) {
       const key = JSON.stringify([String(agent.rowId), agent.toolCallId]);
       byRow.set(key, byRow.has(key) ? null : agent);
     }
+    if (!byRow.size) return;  // Without agents even scanning tool blocks is wasted work.
     for (const block of pane.querySelectorAll('[data-tool-call-id][data-tool-name]')) {
       if (paneOf(block) !== pane) continue;
       const row = block.closest('[data-row-id]');
@@ -321,12 +326,15 @@ function rendererMain(makeMeter, version) {
       if (!summary) continue;
       seen.add(summary);
       const badge = ensureAgent(summary);
-      const info = speedInfo(ready ? meter.get(agent.childSessionId) : { tps: null });
-      const colors = theme === "dark"
-        ? { fast: "#56d6a2", medium: "#ebbf63", slow: "#ff988e", idle: "#adb4c0" }
-        : { fast: "#087b53", medium: "#896008", slow: "#b73d36", idle: "#616b79" };
+      const result = ready ? meter.get(agent.childSessionId) : { tps: null };
+      const info = speedInfo(result);
+      // Band colors come from the shared stylesheet; skip writes while unchanged.
+      const signature = [theme, info.band, info.label, result.est].join(":");
+      if (badge.__zspeed === signature) continue;
+      badge.__zspeed = signature;
       badge.textContent = info.label + " t/s";
-      badge.style.color = colors[info.band];
+      badge.setAttribute("data-speed-band", info.band);
+      badge.setAttribute("data-zspeed-theme", theme);
       badge.title = info.title;
       badge.setAttribute("aria-label", info.aria);
     }
@@ -398,6 +406,11 @@ function rendererMain(makeMeter, version) {
   return tick();
 }
 
+// Built once here so the regression tests exercise the exact injected payload.
+function rendererSource() {
+  return "(" + rendererMain.toString() + ")(" + createSpeedMeter.toString() + "," + JSON.stringify(VERSION) + ")";
+}
+
 function install() {
   if (globalThis.__ZSPEED_LOADED__ === VERSION) return;
   if (typeof globalThis.__ZSPEED_MAIN_DISPOSE__ === "function") globalThis.__ZSPEED_MAIN_DISPOSE__();
@@ -406,7 +419,10 @@ function install() {
   const fs = require("fs");
   const path = require("path");
   const { fileURLToPath } = require("url");
-  const source = "(" + rendererMain.toString() + ")(" + createSpeedMeter.toString() + "," + JSON.stringify(VERSION) + ")";
+  const source = rendererSource();
+  // Constant per install(); rebuilding it every tick would churn ~15KB of strings.
+  const js = "window.__ZSPEED_VERSION__ === " + JSON.stringify(VERSION)
+    + " && typeof window.__ZSPEED_TICK__ === 'function' ? window.__ZSPEED_TICK__() : " + source;
   const hooks = new Map(), pending = new Map(), states = new Map();
   let lastStatus = 0, lastError = "", stopped = false;
   function log(message) {
@@ -424,8 +440,6 @@ function install() {
     const now = Date.now();
     if (pending.has(wc.id) && now - pending.get(wc.id) < 2000) return;
     pending.set(wc.id, now);
-    const js = "window.__ZSPEED_VERSION__ === " + JSON.stringify(VERSION)
-      + " && typeof window.__ZSPEED_TICK__ === 'function' ? window.__ZSPEED_TICK__() : " + source;
     Promise.resolve().then(() => wc.executeJavaScript(js, false)).then(state => {
       if (state) states.set(wc.id, state);
     }).catch(error => {
@@ -470,5 +484,5 @@ function install() {
   log("loaded " + VERSION + " pid=" + process.pid + " refresh=" + REFRESH_MS + "ms source=renderer-store");
 }
 
-module.exports = { createSpeedMeter, rendererMain, install, VERSION, REFRESH_MS };
+module.exports = { createSpeedMeter, rendererMain, rendererSource, install, VERSION, REFRESH_MS };
 if (process.versions.electron && process.type === "browser") install();

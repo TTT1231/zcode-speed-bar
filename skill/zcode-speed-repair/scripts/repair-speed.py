@@ -46,6 +46,8 @@ MIN_ZCODE_VERSION = (3, 17, 1)
 BLOCK = 4194304
 RUNTIME_FILES = ("inject-main.cjs", "speed-bridge.js", "targets.json", "repair-speed.py")
 ESSENTIAL_FILES = ("inject-main.cjs", "speed-bridge.js")
+FINAL_STATE = {"install": "installed", "remove": "removed"}
+MIN_ZCODE_VERSION_TEXT = ".".join(str(part) for part in MIN_ZCODE_VERSION)
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
@@ -217,9 +219,12 @@ def purge_runtime(keep_backups):
     shutil.rmtree(RUNTIME, ignore_errors=True)
     return "purged" if not RUNTIME.exists() else f"not fully deleted; remove {RUNTIME} manually"
 
+def pending_paths(archive):
+    """The metadata and staged file that make up an unfinished replacement."""
+    return RUNTIME / "pending-install.json", archive.with_name(archive.name + ".zspeed.pending")
+
 def ensure_no_pending(archive):
-    meta_path = RUNTIME / "pending-install.json"
-    pending = archive.with_name(archive.name + ".zspeed.pending")
+    meta_path, pending = pending_paths(archive)
     if meta_path.is_file() or pending.is_file():
         raise ValueError(
             "An unfinished pending replacement exists. Fully exit ZCode and wait for "
@@ -228,13 +233,13 @@ def ensure_no_pending(archive):
 
 def wait_for_unlock(archive):
     """Finish this specific, verified repair when the running app releases ASAR."""
-    meta_path = RUNTIME / "pending-install.json"
+    meta_path, _ = pending_paths(archive)
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     pending = Path(meta["pending"])
     if (Path(meta["asar"]).resolve() != archive or Path(meta["runtime"]).resolve() != RUNTIME or
         pending.parent != archive.parent or pending.name != archive.name + ".zspeed.pending"):
         raise ValueError("Pending repair does not belong to this installation")
-    final = {"install": "installed", "remove": "removed"}[meta.get("intent", "install")]
+    final = FINAL_STATE[meta.get("intent", "install")]
     pending_stamp = stamp(pending)
     if file_sha(pending) != meta["sha256"]:
         raise ValueError("Pending repair integrity mismatch")
@@ -288,7 +293,7 @@ def read_version(stream, nodes, base):
 
 def require_supported_version(version):
     """Reject releases below the minimum, including its prerelease versions."""
-    minimum = ".".join(str(part) for part in MIN_ZCODE_VERSION)
+    minimum = MIN_ZCODE_VERSION_TEXT
     match = re.fullmatch(
         r"v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
         r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
@@ -304,14 +309,23 @@ def require_supported_version(version):
             "version-too-low", f"ZCode {version} is below the minimum supported version {minimum}; "
                                "the ASAR was not changed")
 
-def scan_bridge_asset(stream, nodes, base):
-    """Find the asset carrying the bridge marker when the registry cannot point at it."""
+def renderer_assets(nodes):
+    """Renderer bundle assets, largest first."""
     candidates = [name for name in nodes if name.startswith("out/renderer/assets/") and name.endswith(".js")]
     candidates.sort(key=lambda name: int(nodes[name]["size"]), reverse=True)
-    for name in candidates:
+    return candidates
+
+def scan_bridge_asset(stream, nodes, base):
+    """Find the asset carrying the bridge marker when the registry cannot point at it."""
+    for name in renderer_assets(nodes):
         if b"zspeed-bridge:v1 begin" in read_file(stream, nodes, base, name):
             return name
     return None
+
+def read_registered_asset(stream, nodes, base, asset_path):
+    if asset_path not in nodes:
+        raise ValueError(f"Registered asset {asset_path} is missing from the archive; the ASAR was not changed")
+    return read_file(stream, nodes, base, asset_path)
 
 def loader_line():
     url = (RUNTIME / "inject-main.cjs").as_uri()
@@ -324,9 +338,7 @@ def install_plan(stream, nodes, base, targets, version):
                          "checked before registering this version; the ASAR was not changed")
     entry = targets[version]
     asset_path, expected, registry = entry["asset"], entry["assetSha256"], entry["registry"]
-    if asset_path not in nodes:
-        raise ValueError(f"Registered asset {asset_path} is missing from the archive; the ASAR was not changed")
-    old_asset = read_file(stream, nodes, base, asset_path)
+    old_asset = read_registered_asset(stream, nodes, base, asset_path)
     unpatched = BRIDGE_RE.sub(b"", old_asset)
     if sha(unpatched) != expected:
         raise ValueError("Renderer fingerprint mismatch; the ASAR was not changed")
@@ -345,9 +357,7 @@ def remove_plan(stream, nodes, base, targets, version, force):
     asset_path, old_asset, new_asset = None, None, None
     if entry is not None:
         asset_path = entry["asset"]
-        if asset_path not in nodes:
-            raise ValueError(f"Registered asset {asset_path} is missing from the archive; the ASAR was not changed")
-        old_asset = read_file(stream, nodes, base, asset_path)
+        old_asset = read_registered_asset(stream, nodes, base, asset_path)
         new_asset = BRIDGE_RE.sub(b"", old_asset)
         if sha(new_asset) != entry["assetSha256"]:
             raise ValueError("Renderer does not match the registered clean fingerprint; the ASAR was not changed")
@@ -444,10 +454,9 @@ def verify_repack(source, destination, changes):
             checked += 1
         return checked
 
-def apply(archive, intent, version, old, wanted, report, purge_after=None):
+def apply(archive, intent, version, old, wanted, changes, report, purge_after=None):
     """Shared install/remove pipeline: backup, repack, verify, replace or pend."""
     original_stamp = stamp(archive)
-    changes = {name: data for name, data in wanted.items() if old[name] != data}
     now = time.time()
     backup = RUNTIME / "backups" / (time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) +
                                     f"-{int(now % 1 * 1000):03d}" +
@@ -460,7 +469,7 @@ def apply(archive, intent, version, old, wanted, report, purge_after=None):
     (backup / "manifest.json").write_text(json.dumps({"intent": intent, "asar": str(archive),
         "version": version, "originalStamp": original_stamp,
         "files": {name: sha(old[name]) for name in changes}}, indent=2))
-    pending = archive.with_name(archive.name + ".zspeed.pending")
+    meta_path, pending = pending_paths(archive)
     keep_pending = False
     try:
         repack(archive, pending, changes)
@@ -474,7 +483,7 @@ def apply(archive, intent, version, old, wanted, report, purge_after=None):
                         "originalStamp": original_stamp, "pending": str(pending),
                         "sha256": file_sha(pending), "verifiedFiles": checked, "backup": str(backup),
                         "purge": purge_after}
-            (RUNTIME / "pending-install.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+            meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
             keep_pending = True
             save_status(state="pending", intent=intent, version=version,
                         verifiedFiles=checked, backup=str(backup))
@@ -488,7 +497,7 @@ def apply(archive, intent, version, old, wanted, report, purge_after=None):
     finally:
         if not keep_pending:
             pending.unlink(missing_ok=True)
-    final = {"install": "installed", "remove": "removed"}[intent]
+    final = FINAL_STATE[intent]
     save_status(state=final, version=version, verifiedFiles=checked, backup=str(backup), restartRequired=True)
     report.update(bridge=intent == "install", loader=intent == "install")
     if purge_after is not None:
@@ -516,9 +525,7 @@ def add_version(archive, args):
         require_supported_version(version)
         asset_path = args.asset
         if asset_path is None:
-            asset_path = max((name for name in nodes
-                              if name.startswith("out/renderer/assets/") and name.endswith(".js")),
-                             key=lambda name: int(nodes[name]["size"]))
+            asset_path = renderer_assets(nodes)[0]
         if asset_path not in nodes:
             raise ValueError(f"{asset_path} is not in the archive")
         clean = BRIDGE_RE.sub(b"", read_file(stream, nodes, base, asset_path))
@@ -572,7 +579,7 @@ def main():
             if args.command not in ("install", "deploy"):
                 raise
             print(json.dumps({"state": "skipped", "reason": error.reason, "version": version,
-                              "minimumVersion": ".".join(str(part) for part in MIN_ZCODE_VERSION),
+                              "minimumVersion": MIN_ZCODE_VERSION_TEXT,
                               "asar": str(archive), "message": str(error)}, ensure_ascii=False, indent=2))
             return 1
         if args.command == "deploy":
@@ -600,8 +607,8 @@ def main():
         report["bridge"] = asset_path is not None and old[asset_path] == wanted[asset_path]
         report["loader"] = old[MAIN] == wanted[MAIN]
     if args.command == "check":
-        report["pending"] = ((RUNTIME / "pending-install.json").is_file() or
-                             archive.with_name(archive.name + ".zspeed.pending").is_file())
+        meta_path, pending = pending_paths(archive)
+        report["pending"] = meta_path.is_file() or pending.is_file()
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0 if not changes and not report["pending"] else 1
     report["pending"] = False
@@ -615,7 +622,7 @@ def main():
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
     purge_after = {"keepBackups": not verified} if args.command == "remove" else None
-    return apply(archive, args.command, version, old, wanted, report, purge_after)
+    return apply(archive, args.command, version, old, wanted, changes, report, purge_after)
 
 if __name__ == "__main__":
     raise SystemExit(main())
