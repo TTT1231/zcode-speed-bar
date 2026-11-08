@@ -334,7 +334,13 @@ function rendererFixture() {
     appendChild(element) { this.append(element); return element; }
     remove() { if (this.parent) this.parent.children = this.parent.children.filter(el => el !== this); this.parent = null; }
     getClientRects() { return this.isConnected && !this.hidden ? [{}] : []; }
-    getBoundingClientRect() { return { width: 500, height: 700 }; }
+    getBoundingClientRect() {
+      return this.className === "zusage-speed-mini" ? { width: 90, height: 28 } : { width: 500, height: 700 };
+    }
+    addEventListener(name, listener) { (this.listeners ||= new Map()).set(name, listener); }
+    removeEventListener(name, listener) { if (this.listeners?.get(name) === listener) this.listeners.delete(name); }
+    setPointerCapture() {}
+    releasePointerCapture() {}
     closest(selector) {
       const key = selector.includes("data-session-id") ? "data-session-id"
         : selector.includes("data-row-id") ? "data-row-id" : "data-tool-call-id";
@@ -371,14 +377,20 @@ function rendererFixture() {
     addEventListener: (name, listener) => listeners.set(name, listener),
     removeEventListener: name => listeners.delete(name) };
   const bridge = bridgeFixture();
+  const store = new Map();
   const window = {
     __ZSPEED_READ__: sid => bridge.context.__ZSPEED_READ__(sid),
     __ZSPEED_READ_ALL__: () => bridge.context.__ZSPEED_READ_ALL__(),
-    __ZSPEED_RELEASE_CHILDREN__: () => bridge.context.__ZSPEED_RELEASE_CHILDREN__()
+    __ZSPEED_RELEASE_CHILDREN__: () => bridge.context.__ZSPEED_RELEASE_CHILDREN__(),
+    localStorage: {
+      getItem: key => (store.has(key) ? store.get(key) : null),
+      setItem: (key, value) => { store.set(key, String(value)); },
+      removeItem: key => { store.delete(key); }
+    }
   };
   const context = vm.createContext({ window, document, performance: { now: () => now } });
   const source = "(" + rendererMain.toString() + ")(" + createSpeedMeter.toString() + "," + JSON.stringify(VERSION) + ")";
-  return { context, window, document, body, pane, bridge, source, listeners, addPane, Element,
+  return { context, window, document, body, pane, bridge, source, listeners, addPane, Element, store,
     barFor: pane => pane.children.find(element => element.className === "zusage-speed-mini"),
     setNow: time => { now = time; } };
 }
@@ -403,6 +415,63 @@ test("renderer keeps one speed-only capsule per chat, updates in place and clean
   assert.equal(f.body.children.length, 1);
   assert.equal(f.pane.children.length, 0);
   assert.equal(f.listeners.size, 0);
+});
+
+test("the speed capsule drags horizontally, keeps its place per run and recenters on double click", () => {
+  const f = rendererFixture();
+  f.store.set("zspeed-bar-offset", "50");
+  vm.runInContext(f.source, f.context);
+  assert.equal(f.store.has("zspeed-bar-offset"), false);
+  const pointer = clientX => ({ clientX, pointerId: 7, isPrimary: true, preventDefault() {}, stopPropagation() {} });
+  const fire = (el, name, event) => el.listeners.get(name)(event);
+  const capsule = f.barFor(f.pane);
+  assert.equal(capsule.style.transform, "translateX(calc(-50% + 0px))");
+  assert.ok(capsule.title.includes("可左右拖动，双击复位"));
+  fire(capsule, "pointerdown", pointer(250));
+  fire(capsule, "pointermove", pointer(447));
+  assert.equal(capsule.style.transform, "translateX(calc(-50% + 197px))");
+  fire(capsule, "pointermove", pointer(900));
+  assert.equal(capsule.style.transform, "translateX(calc(-50% + 197px))");
+  fire(capsule, "pointerup", pointer(447));
+  capsule.remove();
+  f.window.__ZSPEED_TICK__();
+  const rebuilt = f.barFor(f.pane);
+  assert.notEqual(rebuilt, capsule);
+  assert.equal(rebuilt.style.transform, "translateX(calc(-50% + 197px))");
+  fire(rebuilt, "dblclick", { preventDefault() {}, stopPropagation() {} });
+  assert.equal(rebuilt.style.transform, "translateX(calc(-50% + 0px))");
+  fire(rebuilt, "pointerdown", pointer(0));
+  fire(rebuilt, "pointermove", pointer(-100));
+  fire(rebuilt, "pointerup", pointer(-100));
+  f.window.__ZSPEED_DISPOSE__();
+  vm.runInContext(f.source, f.context);
+  assert.equal(f.barFor(f.pane).style.transform, "translateX(calc(-50% + 0px))");
+  f.window.__ZSPEED_DISPOSE__();
+  assert.equal(f.pane.children.length, 0);
+});
+
+test("side and main panes drag their bars independently", () => {
+  const f = rendererFixture();
+  const side = f.addPane("s2", "workspace-side-1");
+  vm.runInContext(f.source, f.context);
+  const pointer = clientX => ({ clientX, pointerId: 1, isPrimary: true, preventDefault() {}, stopPropagation() {} });
+  const fire = (el, name, event) => el.listeners.get(name)(event);
+  const mainBar = f.barFor(f.pane), sideBar = f.barFor(side);
+  fire(sideBar, "pointerdown", pointer(250));
+  fire(sideBar, "pointermove", pointer(350));
+  fire(sideBar, "pointerup", pointer(350));
+  assert.equal(sideBar.style.transform, "translateX(calc(-50% + 100px))");
+  assert.equal(mainBar.style.transform, "translateX(calc(-50% + 0px))");
+  f.window.__ZSPEED_TICK__();
+  assert.equal(f.barFor(side).style.transform, "translateX(calc(-50% + 100px))");
+  assert.equal(f.barFor(f.pane).style.transform, "translateX(calc(-50% + 0px))");
+  side.attributes["data-session-id"] = "s3";
+  f.window.__ZSPEED_TICK__();
+  assert.equal(f.barFor(side).style.transform, "translateX(calc(-50% + 100px))");
+  fire(sideBar, "dblclick", { preventDefault() {}, stopPropagation() {} });
+  assert.equal(sideBar.style.transform, "translateX(calc(-50% + 0px))");
+  assert.equal(f.store.size, 0);
+  f.window.__ZSPEED_DISPOSE__();
 });
 
 test("three subagents show their own live, waiting and final rates beside the correct task", () => {

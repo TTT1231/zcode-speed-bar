@@ -4,11 +4,12 @@
  * Finished: outputTokens / modelDurationMs from the host's turn summary.
  * Each available conversation is sampled in the background, including inactive tabs.
  * Main and auxiliary conversations each display a bar inside their own pane.
+ * Bars drag horizontally inside their pane; main and side keep their own in-memory offsets.
  * repair-speed.py installs the small read-only bridge after a ZCode upgrade.
  * Reference: ByteRax/zcode-token-usage-statusbar, renderer bridge for 3.17.1.
  */
 "use strict";
-const VERSION = "store-speed-6";
+const VERSION = "store-speed-9";
 const REFRESH_MS = 500;
 
 // Self-contained: the same calculation runs in Electron and regression tests.
@@ -151,6 +152,64 @@ function rendererMain(makeMeter, version) {
   const meter = makeMeter();
   const bars = new Map(), agentBars = new Map();
   let lastPane = null;
+  // Offsets are memory-only; drop keys written by older storage-backed builds.
+  try {
+    const storage = window.localStorage;
+    if (storage) { storage.removeItem("zspeed-bar-offset"); storage.removeItem("zspeed-bar-offsets"); }
+  } catch (_) {}
+  const offsets = new Map();
+  function offsetLimit(bar, pane) {
+    try {
+      const paneWidth = pane.getBoundingClientRect().width;
+      const barWidth = bar.getBoundingClientRect().width;
+      return Number.isFinite(paneWidth) && Number.isFinite(barWidth) && paneWidth > 0 && barWidth > 0
+        ? Math.max(0, paneWidth / 2 - barWidth / 2 - 8) : null;
+    } catch (_) { return null; }
+  }
+  function roleOf(pane) {
+    return pane.getAttribute("data-testid") === "v4-session-pane-workspace-main" ? "main" : "side";
+  }
+  function applyOffset(bar, pane) {
+    const limit = offsetLimit(bar, pane);
+    const raw = offsets.get(roleOf(pane)) || 0;
+    const x = limit === null ? raw : Math.max(-limit, Math.min(limit, raw));
+    bar.style.transform = "translateX(calc(-50% + " + x + "px))";
+  }
+  function attachDrag(bar, pane) {
+    bar.addEventListener("pointerdown", event => {
+      if (event.isPrimary === false) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const role = roleOf(pane);
+      const startX = event.clientX, startOffset = offsets.get(role) || 0;
+      try { bar.setPointerCapture(event.pointerId); } catch (_) {}
+      const move = e => {
+        e.stopPropagation();
+        const limit = offsetLimit(bar, pane);
+        const next = startOffset + (e.clientX - startX);
+        offsets.set(role, limit === null ? next : Math.max(-limit, Math.min(limit, next)));
+        applyOffset(bar, pane);
+      };
+      const finish = e => {
+        bar.removeEventListener("pointermove", move);
+        bar.removeEventListener("pointerup", finish);
+        bar.removeEventListener("pointercancel", cancel);
+        try { bar.releasePointerCapture(event.pointerId); } catch (_) {}
+        if (e && typeof e.stopPropagation === "function") e.stopPropagation();
+      };
+      const cancel = e => finish(e);
+      bar.addEventListener("pointermove", move);
+      bar.addEventListener("pointerup", finish);
+      bar.addEventListener("pointercancel", cancel);
+    });
+    bar.addEventListener("click", e => e.stopPropagation());
+    bar.addEventListener("dblclick", e => {
+      e.preventDefault();
+      e.stopPropagation();
+      offsets.delete(roleOf(pane));
+      applyOffset(bar, pane);
+    });
+  }
   function visible(pane) {
     if (!pane || !pane.isConnected || !pane.getClientRects().length) return false;
     const rect = pane.getBoundingClientRect();
@@ -183,7 +242,7 @@ function rendererMain(makeMeter, version) {
       + "box-sizing:border-box;border:1px solid var(--zs-border);"
       + "font:600 12px/16px var(--font-mono,ui-monospace,Consolas,monospace);"
       + "background:var(--zs-surface);color:var(--zs-text);box-shadow:var(--zs-shadow);"
-      + "pointer-events:none;user-select:none;white-space:nowrap;font-variant-numeric:tabular-nums;";
+      + "touch-action:none;user-select:none;white-space:nowrap;font-variant-numeric:tabular-nums;";
     const style = document.createElement("style");
     style.textContent = ".zusage-speed-mini{--zs-surface:#fff;--zs-text:#202834;--zs-muted:#616b79;"
       + "--zs-border:rgba(27,37,51,.13);--zs-shadow:0 1px 4px rgba(20,30,45,.08);"
@@ -216,6 +275,8 @@ function rendererMain(makeMeter, version) {
     unit.setAttribute("data-speed-unit", "");
     bar.append(bolt, value, unit, style);
     pane.appendChild(bar);
+    attachDrag(bar, pane);
+    applyOffset(bar, pane);
     const entry = { bar, value, signature: "" };
     bars.set(pane, entry);
     return entry;
@@ -299,6 +360,7 @@ function rendererMain(makeMeter, version) {
     for (const pane of panes) {
       const result = meter.get(pane.getAttribute("data-session-id"));
       const entry = ensure(pane), { bar, value } = entry;
+      applyOffset(bar, pane);
       bar.setAttribute("data-zspeed-theme", theme);
       const info = speedInfo(result);
       const next = info.label + ":" + result.mode;
@@ -306,7 +368,7 @@ function rendererMain(makeMeter, version) {
         entry.signature = next;
         value.textContent = info.label;
         bar.setAttribute("data-speed-band", info.band);
-        bar.title = info.title;
+        bar.title = info.title + " · 可左右拖动，双击复位";
         bar.setAttribute("aria-label", info.aria);
       }
       showAgents(pane, bySession.get(pane.getAttribute("data-session-id")), theme, seenAgents);
