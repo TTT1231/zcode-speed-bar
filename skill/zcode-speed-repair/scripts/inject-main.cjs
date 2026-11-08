@@ -5,7 +5,7 @@
  * Each available conversation is sampled in the background, including inactive tabs.
  * Main and auxiliary conversations each display a bar inside their own pane.
  * Bars drag horizontally inside their pane; main and side keep their own in-memory offsets.
- * repair-speed.py installs the small read-only bridge after a ZCode upgrade.
+ * repair-speed.cjs installs the small read-only bridge after a ZCode upgrade.
  * Reference: ByteRax/zcode-token-usage-statusbar, renderer bridge for 3.17.1.
  */
 "use strict";

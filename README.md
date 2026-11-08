@@ -6,12 +6,13 @@ ZCode 状态条：实时速度显示进度条。
 
 ## 安装
 
-安装会修改 ZCode 的 `resources/app.asar`。开始前请确认环境：
+安装会修改 ZCode 的 `resources/app.asar`。只需要一个运行时：
 
-| 环境    | 要求      |
-| ------- | --------- |
-| Python  | 3.8 +     |
-| Node.js | node 20 + |
+| 环境    | 要求 |
+| ------- | ---- |
+| Node.js | node |
+
+支持 Windows/Linux/macOS。目前仅登记了 Windows ZCode 3.17.1 的指纹；其他平台或版本会因校验拒绝安装，须先适配登记。
 
 环境准备好之后，将以下复制给 agent 即可
 
@@ -21,6 +22,6 @@ https://github.com/TTT1231/zcode-speed-bar/blob/main/skill/zcode-speed-repair/SK
 
 ## 卸载
 
-```powershell
+```
 https://github.com/TTT1231/zcode-speed-bar/blob/main/skill/zcode-speed-repair/SKILL.md remove it
 ```
