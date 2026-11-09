@@ -297,7 +297,7 @@ test("bridge never guesses between multiple unmatched or conflicting agent calls
   assert.deepEqual(leases.released, ["child-a", "child-b"]);
 });
 
-test("exact parent-ID matching does not depend on the tool name", () => {
+test("non-agent tool calls do not receive agent speed badges", () => {
   const f = bridgeFixture(), rows = f.snapshot.rows.window;
   rows.push(
     { rowId: 10, turnId: "t1", kind: "toolCall", toolName: "CustomSpawn", toolCallId: "call-x" },
@@ -305,7 +305,7 @@ test("exact parent-ID matching does not depend on the tool name", () => {
   );
   childStores(f, new Map([["child-x", childSnapshot("child-x")]]));
   const agents = f.context.__ZSPEED_READ__("s1").agents;
-  assert.deepEqual(Array.from(agents, a => a.childSessionId), ["child-x"]);
+  assert.deepEqual(Array.from(agents), []);
 });
 
 test("child subscriptions follow a parent reconnect and are bounded in favor of running agents", () => {

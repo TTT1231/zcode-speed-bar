@@ -156,7 +156,7 @@ function rendererMain(makeMeter, version) {
   if (typeof window.__ZSPEED_DISPOSE__ === "function") window.__ZSPEED_DISPOSE__();
   window.__ZSPEED_VERSION__ = version;
   const meter = makeMeter();
-  const bars = new Map(), agentBars = new Map();
+  const bars = new Map(), agentBars = new Map(), toolTimes = new Map();
   let lastPane = null;
   // Offsets are memory-only; drop keys written by older storage-backed builds.
   try {
@@ -343,6 +343,34 @@ function rendererMain(makeMeter, version) {
       badge.setAttribute("aria-label", info.aria);
     }
   }
+  function showTools(pane, snapshot, now, seen, visibleTools) {
+    if (!snapshot || !Array.isArray(snapshot.tools)) return;
+    const byRow = new Map(snapshot.tools.map(tool => [tool.rowId + "|" + tool.toolCallId, tool]));
+    for (const block of pane.querySelectorAll('[data-tool-call-id][data-tool-name]')) {
+      if (paneOf(block) !== pane) continue;
+      const row = block.closest('[data-row-id]');
+      const tool = row && byRow.get(row.getAttribute("data-row-id") + "|" + block.getAttribute("data-tool-call-id"));
+      if (!tool) continue;
+      const key = JSON.stringify([snapshot.sessionId, tool.rowId, tool.toolCallId]);
+      visibleTools.add(key);
+      let timing = toolTimes.get(key);
+      if (!timing && tool.status === "running") {
+        timing = { start: now, elapsed: 0, running: true };
+        toolTimes.set(key, timing);
+      }
+      if (!timing) continue;
+      if (timing.running) timing.elapsed = Math.max(0, now - timing.start);
+      timing.running = tool.status === "running";
+      const summary = Array.from(block.querySelectorAll('[data-testid^="tool-summary-trigger-"]'))
+        .find(element => element.closest('[data-tool-call-id]') === block);
+      if (!summary) continue;
+      seen.add(summary);
+      const badge = ensureAgent(summary);
+      const label = "≥" + (timing.elapsed / 1000).toFixed(1) + " s";
+      badge.textContent = label;
+      badge.setAttribute("aria-label", "已观察工具执行至少 " + (timing.elapsed / 1000).toFixed(1) + " 秒");
+    }
+  }
   function tick() {
     const panes = Array.from(document.querySelectorAll(PANE_SELECTOR)).filter(visible);
     const pane = pickPane(panes);
@@ -366,7 +394,8 @@ function rendererMain(makeMeter, version) {
       if (!paneSet.has(pane)) { entry.bar.remove(); bars.delete(pane); }
     }
     const theme = document.documentElement.classList.contains("dark") ? "dark" : "light";
-    const seenAgents = new Set();
+    const seenAgents = new Set(), visibleTools = new Set();
+    const now = performance.now();
     for (const pane of panes) {
       const result = meter.get(pane.getAttribute("data-session-id"));
       const entry = ensure(pane), { bar, value } = entry;
@@ -380,11 +409,14 @@ function rendererMain(makeMeter, version) {
         bar.setAttribute("data-speed-band", info.band);
         bar.setAttribute("aria-label", info.aria);
       }
-      showAgents(pane, bySession.get(pane.getAttribute("data-session-id")), theme, seenAgents);
+      const snapshot = bySession.get(pane.getAttribute("data-session-id"));
+      showAgents(pane, snapshot, theme, seenAgents);
+      showTools(pane, snapshot, now, seenAgents, visibleTools);
     }
     for (const [summary, badge] of agentBars) if (!seenAgents.has(summary)) {
       badge.remove(); agentBars.delete(summary);
     }
+    for (const key of toolTimes.keys()) if (!visibleTools.has(key)) toolTimes.delete(key);
     // Report the selected conversation in diagnostic status.
     return { ...meter.get(sid), bridge: hasBridge, tickAt: Date.now() };
   }
@@ -398,6 +430,7 @@ function rendererMain(makeMeter, version) {
     for (const badge of agentBars.values()) badge.remove();
     bars.clear();
     agentBars.clear();
+    toolTimes.clear();
     lastPane = null;
     meter.reset();
     if (typeof window.__ZSPEED_RELEASE_CHILDREN__ === "function") window.__ZSPEED_RELEASE_CHILDREN__();

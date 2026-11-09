@@ -39,6 +39,7 @@
   };
   function agentLinks(rows) {
     const calls = rows.filter(row => row.kind === "toolCall" &&
+      ["Agent", "Task", "subagent"].includes(row.toolName) &&
       typeof row.toolCallId === "string" && typeof row.turnId === "string");
     const children = rows.filter(row => row.kind === "subagent" &&
       typeof row.childSessionId === "string" && row.childSessionId && typeof row.turnId === "string");
@@ -155,7 +156,11 @@
         sessionId: snapshot.sessionId, epoch: snapshot.logEpoch, seq: snapshot.seq,
         generation: generations.get(store), phase: snapshot.control?.phase,
         connectionGeneration: store.generation, status: state.status, projectionReady: state.projectionReady,
-        agents, rows: snapshot.rows.window.map(row => ({
+        agents, tools: snapshot.rows.window.filter(row => row.kind === "toolCall" &&
+          !["Agent", "Task", "subagent"].includes(row.toolName) &&
+          typeof row.toolCallId === "string").map(row => ({
+          rowId: row.rowId, toolCallId: row.toolCallId, status: row.status
+        })), rows: snapshot.rows.window.map(row => ({
           id: row.rowId, turnId: row.productTurnId || row.turnId, kind: row.kind,
           chars: characters(row), state: row.state,
           status: row.kind === "toolCall" ? row.status : undefined,
