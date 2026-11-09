@@ -524,8 +524,9 @@ test("three subagents show their own live, waiting and final rates beside the co
   f.window.__ZSPEED_TICK__();
   assert.equal(f.barFor(f.pane).children[1].textContent, "100.0");
   assert.deepEqual(summaries.map(summary => summary.children[0].textContent), ["80.0 t/s", "45.0 t/s", "0.0 t/s"]);
-  assert.equal(summaries[0].children[0].getAttribute("data-speed-band"), "fast");
-  assert.equal(summaries[1].children[0].getAttribute("data-speed-band"), "medium");
+  assert.equal(summaries[0].children[0].getAttribute("data-speed-band"), "medium");
+  assert.equal(summaries[1].children[0].getAttribute("data-speed-band"), "slow");
+  assert.equal(summaries[2].children[0].getAttribute("data-speed-band"), "idle");
   rows[1].state = "completed";
   const finished = children.get("child-b");
   finished.control.phase = "completedSuccess";
@@ -549,6 +550,35 @@ test("three subagents show their own live, waiting and final rates beside the co
   assert.equal(replacement.children.length, 0);
   assert.equal(summaries[1].children.length, 0);
   assert.deepEqual(leases.released, ["child-a", "child-b", "child-c"]);
+});
+
+test("tool badges show observed durations, bands, theme and a frozen result", () => {
+  const f = rendererFixture();
+  const rows = f.bridge.snapshot.rows.window;
+  const call = { rowId: 20, turnId: "t1", kind: "toolCall", toolName: "Read", toolCallId: "read-1", status: "running" };
+  rows.push(call);
+  const row = new f.Element("div", { "data-row-id": "20" });
+  const block = new f.Element("div", { "data-tool-call-id": "read-1", "data-tool-name": "Read" });
+  const summary = new f.Element("div", { "data-testid": "tool-summary-trigger-read-1" });
+  f.pane.append(row); row.append(block); block.append(summary);
+  vm.runInContext(f.source, f.context);
+  const badge = summary.children[0];
+  assert.equal(badge.textContent, "0.1 s");
+  assert.equal(badge.getAttribute("data-speed-band"), "fast");
+  for (const [ms, label, band] of [[1000, "1.0", "fast"], [1100, "1.1", "medium"],
+    [3000, "3.0", "medium"], [3100, "3.1", "slow"], [5000, "5.0", "slow"], [5100, "5.1", "very-slow"]]) {
+    f.setNow(ms); f.window.__ZSPEED_TICK__();
+    assert.equal(badge.textContent, label + " s");
+    assert.equal(badge.getAttribute("data-speed-band"), band);
+  }
+  f.body.classList.contains = name => name === "dark";
+  call.status = "success";
+  f.setNow(5500); f.window.__ZSPEED_TICK__();
+  assert.equal(badge.textContent, "5.5 s");
+  assert.equal(badge.getAttribute("data-zspeed-theme"), "dark");
+  f.setNow(8000); f.window.__ZSPEED_TICK__();
+  assert.equal(badge.textContent, "5.5 s");
+  f.window.__ZSPEED_DISPOSE__();
 });
 
 test("A to B to A keeps independent live speeds while both conversations generate", () => {

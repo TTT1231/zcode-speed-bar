@@ -124,7 +124,7 @@ function createSpeedMeter(singleStream = false) {
       if (waitingForTool) {
         samples = [{ at: now, chars: total }];
         observedGrowth = true;
-        return { ...result, mode: "live", est: true, tps: 0 };
+        return { ...result, mode: "waiting", est: true, tps: 0 };
       }
       const first = samples[0], elapsed = now - first.at;
       if (total > first.chars) observedGrowth = true;
@@ -252,17 +252,19 @@ function rendererMain(makeMeter, version) {
     const style = document.createElement("style");
     style.textContent = ".zusage-speed-mini,.zspeed-agent-mini{--zs-surface:#fff;--zs-text:#202834;--zs-muted:#616b79;"
       + "--zs-border:rgba(27,37,51,.13);--zs-shadow:0 1px 4px rgba(20,30,45,.08);"
-      + "--zs-fast:#087b53;--zs-medium:#896008;--zs-slow:#b73d36}"
+      + "--zs-fast:#15803D;--zs-medium:#A16207;--zs-slow:#C2410C;--zs-very-slow:#B91C1C}"
       + '.zusage-speed-mini[data-zspeed-theme="dark"],.zspeed-agent-mini[data-zspeed-theme="dark"]{--zs-surface:#27292e;--zs-text:#f0f2f5;'
       + "--zs-muted:#adb4c0;--zs-border:rgba(220,227,238,.14);--zs-shadow:0 1px 4px rgba(0,0,0,.14);"
-      + "--zs-fast:#56d6a2;--zs-medium:#ebbf63;--zs-slow:#ff988e}"
+      + "--zs-fast:#4ADE80;--zs-medium:#FACC15;--zs-slow:#FB923C;--zs-very-slow:#F87171}"
       + ".zusage-speed-mini [data-tps]{min-width:5ch;text-align:right;transition:color 160ms ease}"
       + '.zusage-speed-mini[data-speed-band="fast"] [data-tps]{color:var(--zs-fast)}'
       + '.zusage-speed-mini[data-speed-band="medium"] [data-tps]{color:var(--zs-medium)}'
       + '.zusage-speed-mini[data-speed-band="slow"] [data-tps]{color:var(--zs-slow)}'
+      + ".zspeed-agent-mini{color:var(--zs-muted)}"
       + '.zspeed-agent-mini[data-speed-band="fast"]{color:var(--zs-fast)}'
       + '.zspeed-agent-mini[data-speed-band="medium"]{color:var(--zs-medium)}'
       + '.zspeed-agent-mini[data-speed-band="slow"]{color:var(--zs-slow)}'
+      + '.zspeed-agent-mini[data-speed-band="very-slow"]{color:var(--zs-very-slow)}'
       + ".zusage-speed-mini [data-speed-icon]{display:block;flex:none;width:12px;height:12px;color:var(--zs-muted)}"
       + ".zusage-speed-mini [data-speed-unit]{font:400 11px/16px system-ui,sans-serif;color:var(--zs-muted);margin-left:-2px}"
       + "@media(prefers-reduced-motion:reduce){.zusage-speed-mini [data-tps]{transition:none}}";
@@ -290,11 +292,13 @@ function rendererMain(makeMeter, version) {
     bars.set(pane, entry);
     return entry;
   }
-  function speedInfo(result) {
+  function speedInfo(result, agent = false) {
     const tps = Number.isFinite(result.tps) && result.tps >= 0 ? result.tps : null;
     const label = tps === null ? "—" : tps.toFixed(1);
     return { tps, label,
-      band: tps === null || tps === 0 ? "idle" : tps >= 70 ? "fast" : tps >= 40 ? "medium" : "slow",
+      band: tps === null || (agent && (tps === 0 || result.mode === "waiting")) ? "idle" : agent
+        ? tps > 100 ? "fast" : tps >= 70 ? "medium" : tps >= 40 ? "slow" : "very-slow"
+        : tps === 0 ? "idle" : tps >= 70 ? "fast" : tps >= 40 ? "medium" : "slow",
       aria: tps === null ? "正在采样生成速度" : (result.est ? "生成速度约 " : "生成速度 ") + label + " token/s" };
   }
   function ensureAgent(summary) {
@@ -306,8 +310,7 @@ function rendererMain(makeMeter, version) {
     badge.setAttribute("role", "status");
     badge.setAttribute("aria-live", "off");
     badge.style.cssText = "display:inline-block;flex:none;white-space:nowrap;pointer-events:none;user-select:none;"
-      + "font:600 .9em/1.4 var(--font-mono,ui-monospace,Consolas,monospace);font-variant-numeric:tabular-nums;"
-      + "color:var(--zs-muted)";
+      + "font:600 .9em/1.4 var(--font-mono,ui-monospace,Consolas,monospace);font-variant-numeric:tabular-nums;";
     summary.appendChild(badge);
     agentBars.set(summary, badge);
     return badge;
@@ -332,7 +335,7 @@ function rendererMain(makeMeter, version) {
       seen.add(summary);
       const badge = ensureAgent(summary);
       const result = ready ? meter.get(agent.childSessionId) : { tps: null };
-      const info = speedInfo(result);
+      const info = speedInfo(result, true);
       // Band colors come from the shared stylesheet; skip writes while unchanged.
       const signature = [theme, info.band, info.label, result.est].join(":");
       if (badge.__zspeed === signature) continue;
@@ -343,7 +346,7 @@ function rendererMain(makeMeter, version) {
       badge.setAttribute("aria-label", info.aria);
     }
   }
-  function showTools(pane, snapshot, now, seen, visibleTools) {
+  function showTools(pane, snapshot, now, theme, seen) {
     if (!snapshot || !Array.isArray(snapshot.tools)) return;
     const byRow = new Map(snapshot.tools.map(tool => [tool.rowId + "|" + tool.toolCallId, tool]));
     for (const block of pane.querySelectorAll('[data-tool-call-id][data-tool-name]')) {
@@ -352,11 +355,11 @@ function rendererMain(makeMeter, version) {
       const tool = row && byRow.get(row.getAttribute("data-row-id") + "|" + block.getAttribute("data-tool-call-id"));
       if (!tool) continue;
       const key = JSON.stringify([snapshot.sessionId, tool.rowId, tool.toolCallId]);
-      visibleTools.add(key);
       let timing = toolTimes.get(key);
       if (!timing && tool.status === "running") {
         timing = { start: now, elapsed: 0, running: true };
         toolTimes.set(key, timing);
+        if (toolTimes.size > 1024) toolTimes.delete(toolTimes.keys().next().value);
       }
       if (!timing) continue;
       if (timing.running) timing.elapsed = Math.max(0, now - timing.start);
@@ -366,9 +369,16 @@ function rendererMain(makeMeter, version) {
       if (!summary) continue;
       seen.add(summary);
       const badge = ensureAgent(summary);
-      const label = "≥" + (timing.elapsed / 1000).toFixed(1) + " s";
-      badge.textContent = label;
-      badge.setAttribute("aria-label", "已观察工具执行至少 " + (timing.elapsed / 1000).toFixed(1) + " 秒");
+      const seconds = timing.elapsed / 1000;
+      const label = Math.max(0.1, seconds).toFixed(1);
+      const band = seconds <= 1 ? "fast" : seconds <= 3 ? "medium" : seconds <= 5 ? "slow" : "very-slow";
+      const signature = ["tool", theme, band, label].join(":");
+      if (badge.__zspeed === signature) continue;
+      badge.__zspeed = signature;
+      badge.textContent = label + " s";
+      badge.setAttribute("data-speed-band", band);
+      badge.setAttribute("data-zspeed-theme", theme);
+      badge.setAttribute("aria-label", "工具观察耗时约 " + label + " 秒");
     }
   }
   function tick() {
@@ -394,7 +404,7 @@ function rendererMain(makeMeter, version) {
       if (!paneSet.has(pane)) { entry.bar.remove(); bars.delete(pane); }
     }
     const theme = document.documentElement.classList.contains("dark") ? "dark" : "light";
-    const seenAgents = new Set(), visibleTools = new Set();
+    const seenAgents = new Set();
     const now = performance.now();
     for (const pane of panes) {
       const result = meter.get(pane.getAttribute("data-session-id"));
@@ -411,12 +421,11 @@ function rendererMain(makeMeter, version) {
       }
       const snapshot = bySession.get(pane.getAttribute("data-session-id"));
       showAgents(pane, snapshot, theme, seenAgents);
-      showTools(pane, snapshot, now, seenAgents, visibleTools);
+      showTools(pane, snapshot, now, theme, seenAgents);
     }
     for (const [summary, badge] of agentBars) if (!seenAgents.has(summary)) {
       badge.remove(); agentBars.delete(summary);
     }
-    for (const key of toolTimes.keys()) if (!visibleTools.has(key)) toolTimes.delete(key);
     // Report the selected conversation in diagnostic status.
     return { ...meter.get(sid), bridge: hasBridge, tickAt: Date.now() };
   }
