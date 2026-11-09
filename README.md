@@ -9,6 +9,10 @@ ZCode 状态条：实时速度显示进度条。
 | Node.js | node      |
 | ZCode   | v3.17.1 + |
 
+## 效果演示
+
+![ZCode 速度悬浮条效果演示](./demo.png)
+
 ## 安装
 
 支持 Windows/Linux/macOS。
