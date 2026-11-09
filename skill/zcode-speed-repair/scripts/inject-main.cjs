@@ -1,4 +1,4 @@
-/* ZCode speed only, renderer-store edition (3.17.1).
+/* ZCode speed only, renderer-store edition.
  * Electron main-process clock: every 500ms, independent of DB writes.
  * Live: a 2s rolling window of assistant/reasoning/tool-input characters.
  * Finished: outputTokens / modelDurationMs from the host's turn summary.

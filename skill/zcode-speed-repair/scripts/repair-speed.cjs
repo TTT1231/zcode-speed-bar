@@ -4,22 +4,29 @@
  * The files beside this script are the source of truth. Machine-local state and deployed runtime
  * files live in ~/.zcode/zcode-speed. install and deploy sync the runtime files; remove
  * also syncs them before stripping the recognized bridge and loader. Removal
- * normally cleans the runtime directory, keeping backups/ after an unverified
- * --force strip. Running this script from inside that directory preserves it.
+ * normally cleans the runtime directory. Running this script from inside that
+ * directory preserves it.
  *
  * app.asar is located automatically per platform: the Windows uninstall registry
  * (via reg.exe) and common install roots; on macOS and Linux the standard app
- * layouts. Pass --asar to override. Known versions live in targets.json next to
- * this script; add-version records a version with the registry variable supplied
- * by the caller and the platform it was verified on. Entries without a platform
- * predate the field and mean win32. The minimum supported ZCode version is
- * 3.17.1; registration and runtime compatibility still need separate validation.
+ * layouts. Pass --asar to override. The platform is only detected at runtime to
+ * pick installation paths; the adaptation itself reads the archive contents and
+ * is platform-independent. The minimum supported ZCode version is 3.17.1.
  *
- * Registered renderer fingerprints are checked; mainSha256 is recorded but not
- * checked. Repacking verifies file contents, not whole-archive equality with an
- * official package. Pending metadata keeps originalStamp as a JSON number array
- * (size, mtimeNs, ino) so an older Python waiter can still read it; mtimeNs
- * exceeds Number precision, so it is serialized and parsed digit-exactly.
+ * Adaptation is automatic, with no per-version registration: install scans the
+ * renderer assets once for the store shape (FEATURES in speed-bridge.js) and
+ * identifies the registry variable from structural anchors whose property names
+ * survive minification (layer:new, stale, R.set). Every anchor site is verified
+ * on its own; candidates must agree, or install refuses. --registry overrides
+ * detection only when the anchors are ambiguous, and a given name must still
+ * pass the structural checks. verify reports the detection read-only.
+ *
+ * The injected bridge carries the zspeed-bridge:v1 marker; remove finds it
+ * without any registry, so installs by this tool or by the older Python one are
+ * always recognized and strippable. Pending metadata keeps originalStamp as a
+ * JSON number array (size, mtimeNs, ino) so an older Python waiter can still
+ * read it; mtimeNs exceeds Number precision, so it is serialized and parsed
+ * digit-exactly.
  */
 const fs = require("fs");
 const path = require("path");
@@ -29,9 +36,13 @@ const { spawn, spawnSync } = require("child_process");
 
 const SRC = __dirname;                                             // bundled files (source of truth)
 let RUNTIME = path.join(os.homedir(), ".zcode", "zcode-speed");    // deployed copies + machine-local state
-const TARGETS_PATH = path.join(SRC, "targets.json");
 const MAIN = "out/main/index.js";
+const BRIDGE_MARK = "zspeed-bridge:v1 begin";
 const BRIDGE_RE = /\n?\/\* zspeed-bridge:v1 begin \*\/[\s\S]*?\/\* zspeed-bridge:v1 end \*\/\n?/g;
+// The bridge template's first line binds the registry; substituted installs
+// always carry this exact shape, so the variable can be read back from any
+// install made by this tool or its Python predecessor.
+const REGISTRY_LINE_RE = /const registry = ([A-Za-z_$][\w$]*);/;
 // Matches a zusage loader line from any runtime directory (the directory can
 // move between installs), so a new install never leaves a stale line behind.
 const LOADER_RE = /\n;import\("[^"]*inject-main\.cjs"\)\.then\(\(\) => null, \(e\) => console\.error\("\[zusage\] load failed", e\)\);\n?/g;
@@ -40,11 +51,11 @@ const LOADER_RE = /\n;import\("[^"]*inject-main\.cjs"\)\.then\(\(\) => null, \(e
 const FEATURES = ["productTurnId", "rowId", "logEpoch", "assistantText", "projectionReady"];
 const MIN_ZCODE_VERSION = [3, 17, 1];
 const BLOCK = 4194304;
-const RUNTIME_FILES = ["inject-main.cjs", "speed-bridge.js", "targets.json", "repair-speed.cjs"];
+const RUNTIME_FILES = ["inject-main.cjs", "speed-bridge.js", "repair-speed.cjs"];
 const ESSENTIAL_FILES = ["inject-main.cjs", "speed-bridge.js"];
 const FINAL_STATE = { install: "installed", remove: "removed" };
 const MIN_ZCODE_VERSION_TEXT = MIN_ZCODE_VERSION.join(".");
-const COMMANDS = ["install", "remove", "check", "wait", "add-version", "deploy"];
+const COMMANDS = ["install", "remove", "check", "wait", "deploy", "verify"];
 
 // Indirection points for tests: swap replaceFile to simulate the host's file
 // lock, spawnWaiter to skip the background process, installRoots to inject
@@ -99,34 +110,6 @@ function readFileNode(fd, nodes, base, name) {
   if (node.unpacked) throw new Error("Target is unpacked: " + name);
   const data = readAt(fd, base + Number(node.offset), node.size);
   if (data.length !== node.size) throw new Error("Truncated ASAR file: " + name);
-  return data;
-}
-
-function loadTargets(targetsPath, required = true) {
-  let data = null;
-  let text = null;
-  try {
-    text = fs.readFileSync(targetsPath, "utf8");
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
-  if (text !== null) {
-    try {
-      data = JSON.parse(text);
-    } catch (error) {
-      if (required) throw new Error(`Version registry ${targetsPath} is corrupt: ${error.message}`);
-      data = null;
-    }
-  }
-  if (data === null) {
-    if (required) throw new Error(`Version registry ${targetsPath} is missing; run add-version first`);
-    return {};
-  }
-  if (typeof data !== "object" || Array.isArray(data) ||
-      Object.values(data).some(value => typeof value !== "object" || value === null || Array.isArray(value))) {
-    if (required) throw new Error(`Version registry ${targetsPath} is corrupt`);
-    return {};
-  }
   return data;
 }
 
@@ -301,6 +284,8 @@ function saveStatus(fields) {
 
 function purgeRuntime(keepBackups) {
   // Delete the runtime directory once nothing injected is left that might need restoring.
+  // keepBackups only arrives from old pending metadata written before an
+  // unverified --force strip existed; current removals are always verified.
   if (!fs.existsSync(RUNTIME)) return "already absent";
   if (path.resolve(SRC) === path.resolve(RUNTIME))
     return "kept: this script runs inside it; delete the directory manually";
@@ -522,18 +507,202 @@ function rendererAssets(nodes) {
     .sort((a, b) => Number(nodes[b].size) - Number(nodes[a].size));
 }
 
-function scanBridgeAsset(fd, nodes, base) {
-  // Find the asset carrying the bridge marker when the registry cannot point at it.
-  for (const name of rendererAssets(nodes)) {
-    if (readFileNode(fd, nodes, base, name).includes("zspeed-bridge:v1 begin")) return name;
+function contextSnippets(data, radius = 100) {
+  // Excerpts around each feature string to help locate where the shape moved.
+  const snippets = {};
+  for (const feature of FEATURES) {
+    const index = data.indexOf(feature);
+    if (index >= 0)
+      snippets[feature] = Buffer.from(String(data).slice(Math.max(0, index - radius), index + radius), "latin1").toString("utf8");
+  }
+  return snippets;
+}
+
+function stripBridge(text) {
+  return text.replace(BRIDGE_RE, "");
+}
+
+function bridgeFor(registry) {
+  // The bundled bridge is the only baseline; the registry variable is the one
+  // per-version datum, resolved by detection or an explicit --registry.
+  return fs.readFileSync(asset("speed-bridge.js")).toString("latin1")
+    .replaceAll("__ZSPEED_REGISTRY__", () => registry);
+}
+
+function escapeIdent(name) {
+  if (!/^[A-Za-z_$][\w$]*$/.test(name)) throw new Error(`Not an identifier: ${JSON.stringify(name)}`);
+  return name.replace(/\$/g, "\\$");
+}
+
+function findObjectClose(text, from, limit) {
+  // Walk forward from a position inside an object literal to the `}` that
+  // closes it; strings holding braces can skew the count, accepted for the
+  // short windows involved. Returns the index of that `}`, or -1.
+  let depth = 1; // `from` sits inside the object, next to its properties
+  const end = Math.min(text.length, from + limit);
+  for (let index = from; index < end; index++) {
+    const ch = text[index];
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function findObjectOpen(text, from, limit) {
+  // Walk backward to the `{` opening the object containing `from`; returns
+  // { open, owner } where owner is the identifier the literal is assigned to,
+  // or null when the object is not directly assigned.
+  let depth = 0;
+  const start = Math.max(0, from - limit);
+  for (let index = from; index >= start; index--) {
+    const ch = text[index];
+    if (ch === "}") depth++;
+    else if (ch === "{") {
+      if (depth === 0) {
+        const owner = /([A-Za-z_$][\w$]*)=$/.exec(text.slice(Math.max(0, index - 200), index));
+        return { open: index, owner: owner ? owner[1] : null };
+      }
+      depth--;
+    }
   }
   return null;
 }
 
-function readRegisteredAsset(fd, nodes, base, assetPath) {
-  if (!(assetPath in nodes))
-    throw new Error(`Registered asset ${assetPath} is missing from the archive; the ASAR was not changed`);
-  return readFileNode(fd, nodes, base, assetPath);
+// One `layer:new X(` site becomes a candidate only when it sits in an object
+// that is flagged `stale:!1` and stored via `R.set(owner, entry)` — the exact
+// lifecycle the bridge depends on. Call sites in hooks or components (no flag,
+// no set) fail here instead of producing false candidates.
+function validateAnchorSite(text, index, layerClass, failures) {
+  const fail = reason => {
+    if (failures && !failures.reason) failures.reason = reason;
+    return null;
+  };
+  const close = findObjectClose(text, index, 600);
+  if (close < 0 || text.slice(close - 8, close) !== "stale:!1")
+    return fail("no `stale:!1` object holding `layer:new`");
+  const setCall = /^,([A-Za-z_$][\w$]*)\.set\(([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?),([A-Za-z_$][\w$]*)\)/
+    .exec(text.slice(close + 1, close + 100));
+  if (!setCall) return fail("the entry object is not stored via `R.set(`");
+  const open = findObjectOpen(text, index, 600);
+  const registry = setCall[1];
+  if (open && open.owner && setCall[3] !== open.owner)
+    return fail(`\`${registry}.set(\` stores a different object than the \`${layerClass}\` entry`);
+  const esc = escapeIdent(registry);
+  if (!new RegExp("(?:^|[^\\w$])" + esc + "=new Map\\b").test(text))
+    return fail(`\`${registry}\` has no \`=new Map\` declaration`);
+  if (!new RegExp("(?:^|[^\\w$])" + esc + "\\.delete\\([A-Za-z_$][\\w$]*\\),[A-Za-z_$][\\w$]*\\.stale=!0").test(text))
+    return fail(`\`${registry}\` has no \`delete(...),x.stale=!0\` lifecycle`);
+  const classDecl = new RegExp("(?:^|[^\\w$])(?:" + escapeIdent(layerClass) +
+    "\\s*=\\s*class[\\s{(;]|class\\s+" + escapeIdent(layerClass) + "(?![\\w$]))").exec(text);
+  if (!classDecl) return fail(`\`${layerClass}\` is not a class declaration`);
+  const classBody = text.slice(classDecl.index, classDecl.index + 4000);
+  for (const token of ["acquire(", "disposed", "entries", "store:"]) {
+    if (!classBody.includes(token))
+      return fail(`class \`${layerClass}\` lacks \`${token}\``);
+  }
+  return { registry, layerClass };
+}
+
+function detectStoreAsset(text) {
+  // Stage machine over one renderer asset:
+  //   injected  - our marker is present; the registry is read back from the
+  //               bridge template line so the install can be rebuilt or upgraded.
+  //   ready     - the store shape and one consistent set of anchors are found.
+  //   features  - the store shape is missing; upstream may have refactored.
+  //   anchors   - shape present but no site passed the structural checks.
+  //   ambiguous - several verified candidate registries; --registry can decide.
+  const missing = FEATURES.filter(feature => !text.includes(feature));
+  if (missing.length)
+    return { stage: "features", missing, snippets: contextSnippets(text) };
+  const failures = { reason: "" };
+  const seen = new Set(), candidates = [];
+  for (const match of text.matchAll(/layer:new ([A-Za-z_$][\w$]*)\(/g)) {
+    const site = validateAnchorSite(text, match.index, match[1], failures);
+    if (site) {
+      const key = site.registry + "\u0000" + site.layerClass;
+      if (!seen.has(key)) { seen.add(key); candidates.push(site); }
+    }
+  }
+  if (candidates.length === 1) return { stage: "ready", ...candidates[0] };
+  if (candidates.length > 1) return { stage: "ambiguous", candidates };
+  return { stage: "anchors", reason: failures.reason || "no `layer:new` site found" };
+}
+
+function verifyRegistryCandidate(text, registry) {
+  // Structural checks for a manually supplied --registry: the same evidence
+  // detection would have used, minus the site walk.
+  try {
+    const esc = escapeIdent(registry);
+    return new RegExp("(?:^|[^\\w$])" + esc + "=new Map\\b").test(text) &&
+      text.includes("stale:!1}," + registry + ".set(") &&
+      new RegExp("(?:^|[^\\w$])" + esc + "\\.delete\\([A-Za-z_$][\\w$]*\\),[A-Za-z_$][\\w$]*\\.stale=!0").test(text);
+  } catch (_) {
+    return false;
+  }
+}
+
+function scanRendererStore(fd, nodes, base) {
+  // One pass over the renderer assets: marker and store shape are decided on
+  // the same read. Largest assets come first, so the first ready hit wins.
+  const scan = { injected: [], ready: [], ambiguous: [], anchorFailed: null, featuresMissing: null };
+  for (const name of rendererAssets(nodes)) {
+    const text = readFileNode(fd, nodes, base, name).toString("latin1");
+    if (text.includes(BRIDGE_MARK)) { scan.injected.push(name); continue; }
+    const detection = detectStoreAsset(text);
+    if (detection.stage === "ready") scan.ready.push({ asset: name, text, ...detection });
+    else if (detection.stage === "ambiguous") scan.ambiguous.push({ asset: name, text, ...detection });
+    else if (detection.stage === "anchors" && !scan.anchorFailed)
+      scan.anchorFailed = { asset: name, ...detection };
+    else if (detection.stage === "features" && !scan.featuresMissing)
+      scan.featuresMissing = { asset: name, ...detection };
+  }
+  // Ready assets must agree on the registry; otherwise they are ambiguous too.
+  if (scan.ready.length > 1) {
+    const registries = new Set(scan.ready.map(entry => entry.registry));
+    if (registries.size > 1) {
+      scan.ambiguous.unshift({
+        asset: scan.ready[0].asset, text: scan.ready[0].text, stage: "ambiguous",
+        candidates: scan.ready.map(entry => ({ registry: entry.registry, layerClass: entry.layerClass })),
+      });
+      scan.ready = [];
+    } else scan.ready = [scan.ready[0]];
+  }
+  return scan;
+}
+
+function unsupportedStoreError(scan, manualRegistry) {
+  // Error text per failure stage. --registry only rescues anchor ambiguity or
+  // a changed anchor shape; it cannot help when the store shape is gone.
+  if (scan.featuresMissing) {
+    const missing = scan.featuresMissing.missing.join(", ");
+    return new Error("The renderer store shape was not found (missing: " + missing +
+      "); upstream may have refactored and speed-bridge.js needs updating; " +
+      "the ASAR was not changed");
+  }
+  if (scan.ambiguous.length) {
+    const names = scan.ambiguous[0].candidates.map(candidate =>
+      candidate.registry + " (class " + candidate.layerClass + ")").join(", ");
+    return new Error("Ambiguous registry candidates: " + names +
+      "; re-run with --registry <name> to pick one; the chosen name must still " +
+      "pass the structural checks; the ASAR was not changed");
+  }
+  let message = "The store registry anchors were not recognized (" +
+    (scan.anchorFailed ? scan.anchorFailed.reason : "no candidate site") +
+    "); run verify for diagnostics; the ASAR was not changed";
+  if (manualRegistry) message += "; --registry " + manualRegistry + " was given but its " +
+    "structural checks did not pass either";
+  return new Error(message);
+}
+
+function extractInjectedRegistry(text) {
+  // Read the variable back from our own bridge template inside the injected block.
+  const marker = text.indexOf(BRIDGE_MARK);
+  if (marker < 0) return null;
+  const match = REGISTRY_LINE_RE.exec(text.slice(marker, marker + 500));
+  return match ? match[1] : null;
 }
 
 function toFileUri(archivePath) {
@@ -563,87 +732,76 @@ function loaderLine(runtime = RUNTIME) {
     '(e) => console.error("[zusage] load failed", e));';
 }
 
-function installPlan(fd, nodes, base, targets, version, platform = process.platform) {
-  if (!(version in targets))
-    throw new Error(`ZCode ${version} has no verified speed bridge; compatibility must be ` +
-      "checked before registering this version; the ASAR was not changed");
-  const entry = targets[version];
-  const entryPlatform = entry.platform || "win32"; // entries without a platform predate the field
-  if (entryPlatform !== platform)
-    throw new Error(`ZCode ${version}'s speed bridge was verified on ${entryPlatform}; ` +
-      `${platform} builds must be adapted and registered separately; the ASAR was not changed`);
-  const assetPath = entry.asset, expected = entry.assetSha256, registry = entry.registry;
-  const oldAsset = readRegisteredAsset(fd, nodes, base, assetPath);
-  const [clean, actual] = cleanAsset(oldAsset);
-  if (actual !== expected)
-    throw new Error(`Renderer fingerprint mismatch; the ASAR was not changed ` +
-      `(registered ${expected.slice(0, 12)}, found ${actual.slice(0, 12)})`);
+function installPlan(fd, nodes, base, version, manualRegistry) {
+  const scan = scanRendererStore(fd, nodes, base);
+  if (scan.injected.length > 1)
+    throw new Error("Multiple injected renderer assets found; refusing to guess; the ASAR was not changed");
   const oldMain = readFileNode(fd, nodes, base, MAIN);
-  const bridge = fs.readFileSync(asset("speed-bridge.js")).toString("latin1")
-    .replaceAll("__ZSPEED_REGISTRY__", () => registry);
-  const line = loaderLine();
   const oldMainText = oldMain.toString("latin1");
+  const line = loaderLine();
   // Already injected counts regardless of the trailing newline older tools left out.
   const found = [...oldMainText.matchAll(LOADER_RE)].map(match => match[0]);
   const loaderPresent = found.length === 1 && (found[0] === line || found[0] === line + "\n");
-  const wantedAsset = clean + "\n" + bridge;
+  const wantedMain = loaderPresent ? oldMainText : oldMainText.replace(LOADER_RE, "") + line + "\n";
+  let assetPath, oldAsset, wantedAsset, presentBridge;
+  if (scan.injected.length === 1) {
+    // Rebuild from the clean part with the bundled bridge so a bridge source
+    // upgrade rewrites the injected copy in place.
+    assetPath = scan.injected[0];
+    oldAsset = readFileNode(fd, nodes, base, assetPath);
+    const text = oldAsset.toString("latin1");
+    let registry = extractInjectedRegistry(text);
+    if (registry === null) {
+      const detected = detectStoreAsset(stripBridge(text));
+      if (detected.stage === "ready") registry = detected.registry;
+    }
+    if (registry === null)
+      throw new Error("The injected bridge marker is present but its registry variable cannot " +
+        "be identified; run verify for diagnostics; the ASAR was not changed");
+    wantedAsset = stripBridge(text) + "\n" + bridgeFor(registry);
+    presentBridge = oldAsset.equals(Buffer.from(wantedAsset, "latin1"));
+  } else {
+    let entry = scan.ready[0] || null;
+    if (!entry && scan.ambiguous.length && manualRegistry &&
+        verifyRegistryCandidate(scan.ambiguous[0].text, manualRegistry))
+      entry = { asset: scan.ambiguous[0].asset, text: scan.ambiguous[0].text, registry: manualRegistry };
+    if (!entry) throw unsupportedStoreError(scan, manualRegistry);
+    assetPath = entry.asset;
+    oldAsset = readFileNode(fd, nodes, base, assetPath);
+    wantedAsset = entry.text + "\n" + bridgeFor(entry.registry);
+    presentBridge = false;
+  }
   return {
     assetPath,
     old: { [assetPath]: oldAsset, [MAIN]: oldMain },
-    wanted: { [assetPath]: wantedAsset,
-      // Loader lines from any runtime directory are dropped first.
-      [MAIN]: loaderPresent ? oldMainText : oldMainText.replace(LOADER_RE, "") + line + "\n" },
-    present: { bridge: oldAsset.equals(Buffer.from(wantedAsset, "latin1")), loader: loaderPresent },
+    wanted: { [assetPath]: wantedAsset, [MAIN]: wantedMain },
+    present: { bridge: presentBridge, loader: loaderPresent },
   };
 }
 
-function removePlan(fd, nodes, base, targets, version, force) {
-  const entry = targets[version];
-  let assetPath = null, oldAsset = null, newAsset = null;
-  if (entry) {
-    assetPath = entry.asset;
-    oldAsset = readRegisteredAsset(fd, nodes, base, assetPath);
-    const [clean, actual] = cleanAsset(oldAsset);
-    if (actual !== entry.assetSha256)
-      throw new Error("Renderer does not match the registered clean fingerprint; the ASAR was not changed");
-    newAsset = clean;
-  } else {
-    assetPath = scanBridgeAsset(fd, nodes, base);
-    if (assetPath !== null && !force)
-      throw new Error(`ZCode ${version} is not registered; re-run remove with --force to skip ` +
-        "hash verification; the ASAR was not changed");
-    if (assetPath !== null) {
-      oldAsset = readFileNode(fd, nodes, base, assetPath);
-      newAsset = stripBridge(oldAsset.toString("latin1"));
-    }
+function removePlan(fd, nodes, base) {
+  // The bridge marker is the proof of our injection; no registry or force is
+  // needed to strip it, whatever else changed in the asset since.
+  let assetPath = null, oldAsset = null;
+  for (const name of rendererAssets(nodes)) {
+    const data = readFileNode(fd, nodes, base, name);
+    if (data.toString("latin1").includes(BRIDGE_MARK)) { assetPath = name; oldAsset = data; break; }
   }
   const oldMain = readFileNode(fd, nodes, base, MAIN);
   const oldMainText = oldMain.toString("latin1");
-  const old = { [MAIN]: oldMain };
   const wantedMain = oldMainText.replace(LOADER_RE, "");
-  const wanted = { [MAIN]: wantedMain };
+  const old = { [MAIN]: oldMain }, wanted = { [MAIN]: wantedMain };
   if (assetPath !== null) {
     old[assetPath] = oldAsset;
-    wanted[assetPath] = newAsset;
+    wanted[assetPath] = Buffer.from(stripBridge(oldAsset.toString("latin1")), "latin1");
   }
-  // Verified only when a registered fingerprint confirmed the clean result; an
-  // unverified --force strip keeps the backups around for manual rollback.
+  // Verified whenever the marker confirmed the clean result or nothing of ours
+  // was in the renderer at all; only that keeps the unconditional runtime purge.
   return {
-    assetPath, old, wanted,
-    verified: entry != null || assetPath === null,
-    present: { bridge: assetPath !== null && oldAsset.toString("latin1") !== newAsset,
+    assetPath, old, wanted, verified: true,
+    present: { bridge: assetPath !== null && !old[assetPath].equals(wanted[assetPath]),
       loader: wantedMain !== oldMainText },
   };
-}
-
-function stripBridge(text) {
-  return text.replace(BRIDGE_RE, "");
-}
-
-function cleanAsset(buffer) {
-  // Registered fingerprints are computed over the bridge-stripped asset text.
-  const text = stripBridge(buffer.toString("latin1"));
-  return [text, sha(Buffer.from(text, "latin1"))];
 }
 
 function syntaxCheck(contents) {
@@ -836,58 +994,56 @@ function apply(archive, intent, version, old, changes, report, purgeAfter, write
   return 0;
 }
 
-function contextSnippets(data, radius = 100) {
-  // Excerpts around each feature string to help locate the registry variable.
-  const snippets = {};
-  for (const feature of FEATURES) {
-    const index = data.indexOf(feature);
-    if (index >= 0)
-      snippets[feature] = Buffer.from(data.slice(Math.max(0, index - radius), index + radius), "latin1").toString("utf8");
-  }
-  return snippets;
-}
-
-function addVersion(archive, args, write) {
-  if (!args.registry || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(args.registry))
-    throw new Error("--registry must name the bundle variable holding the store registry");
+function verifyCommand(archive, write) {
+  // Read-only adaptation report: what would install target and why. No
+  // deploy, no pending check, no minimum-version gate; exit 0 only when
+  // install would find a target (ready or injected).
+  const report = { asar: archive, minimumVersion: MIN_ZCODE_VERSION_TEXT, command: "verify" };
   const fd = fs.openSync(archive, "r");
   try {
     const [header, base] = readHeader(fd);
     const nodes = Object.fromEntries(listFiles(header));
-    const version = readVersion(fd, nodes, base);
-    requireSupportedVersion(version);
-    let assetPath = args.asset;
-    if (assetPath === undefined || assetPath === null) assetPath = rendererAssets(nodes)[0];
-    if (!(assetPath in nodes)) throw new Error(`${assetPath} is not in the archive`);
-    const [clean, assetSha256] = cleanAsset(readFileNode(fd, nodes, base, assetPath));
-    const missing = FEATURES.filter(feature => !clean.includes(feature));
-    if (missing.length)
-      throw new Error(`${assetPath} lacks the store shape the bridge reads ` +
-        `(${missing.join(", ")}); speed-bridge.js needs updating before ${version} can be registered`);
-    const mainClean = readFileNode(fd, nodes, base, MAIN).toString("latin1").replace(LOADER_RE, "");
-    const targets = loadTargets(args.targets || TARGETS_PATH, false);
-    if (version in targets && !args.force)
-      throw new Error(`${version} is already registered; re-run with --force to overwrite`);
-    targets[version] = {
-      asset: assetPath,
-      assetSha256,
-      main: MAIN,
-      mainSha256: sha(Buffer.from(mainClean, "latin1")),
-      registry: args.registry,
-      platform: process.platform,
-    };
-    const sorted = Object.fromEntries(Object.keys(targets).sort().map(name => [name, targets[name]]));
-    fs.writeFileSync(args.targets || TARGETS_PATH, JSON.stringify(sorted, null, 2) + "\n");
-    write(JSON.stringify({
-      registered: version, targets: String(args.targets || TARGETS_PATH), asset: assetPath,
-      assetSha256,
-      mainSha256: targets[version].mainSha256, registry: args.registry,
-      platform: process.platform, featureContext: contextSnippets(clean),
-    }, null, 2) + "\n");
-    return 0;
+    try {
+      report.version = readVersion(fd, nodes, base);
+    } catch (_) {
+      report.version = null;
+    }
+    const scan = scanRendererStore(fd, nodes, base);
+    if (scan.injected.length) {
+      report.stage = "injected";
+      report.injectedAssets = scan.injected;
+      const registry = extractInjectedRegistry(
+        readFileNode(fd, nodes, base, scan.injected[0]).toString("latin1"));
+      if (registry !== null) report.registry = registry;
+      report.ok = true;
+    } else if (scan.ready.length) {
+      report.stage = "ready";
+      report.asset = scan.ready[0].asset;
+      report.registry = scan.ready[0].registry;
+      report.layerClass = scan.ready[0].layerClass;
+      report.ok = true;
+    } else {
+      report.ok = false;
+      if (scan.ambiguous.length) {
+        report.stage = "ambiguous";
+        report.asset = scan.ambiguous[0].asset;
+        report.candidates = scan.ambiguous[0].candidates;
+      } else if (scan.anchorFailed) {
+        report.stage = "anchors";
+        report.asset = scan.anchorFailed.asset;
+        report.reason = scan.anchorFailed.reason;
+      } else {
+        report.stage = "features";
+        report.asset = scan.featuresMissing ? scan.featuresMissing.asset : null;
+        report.missing = scan.featuresMissing ? scan.featuresMissing.missing : FEATURES;
+        if (scan.featuresMissing) report.snippets = scan.featuresMissing.snippets;
+      }
+    }
   } finally {
     fs.closeSync(fd);
   }
+  write(JSON.stringify(report, null, 2) + "\n");
+  return report.ok ? 0 : 1;
 }
 
 function parseArgs(argv) {
@@ -896,8 +1052,8 @@ function parseArgs(argv) {
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
     if (arg === "--force") {
-      args.force = true;
-    } else if (["--asar", "--targets", "--registry", "--asset", "--runtime"].includes(arg)) {
+      args.force = true; // accepted for compatibility; removal no longer needs it
+    } else if (["--asar", "--registry", "--runtime"].includes(arg)) {
       const value = argv[++index];
       if (value === undefined) throw new Error(`${arg} requires a value`);
       args[arg.slice(2)] = value;
@@ -906,8 +1062,9 @@ function parseArgs(argv) {
       commandSeen = true;
     } else {
       throw new Error(`Unknown argument: ${arg}\n` +
-        "Usage: repair-speed.cjs [install|remove|check|wait|add-version|deploy] " +
-        "[--asar path] [--targets path] [--registry name] [--asset path] [--runtime dir] [--force]");
+        "Usage: repair-speed.cjs [install|remove|check|wait|deploy|verify] " +
+        "[--asar path] [--runtime dir] [--registry name] [--force]\n" +
+        "--registry overrides detection only for ambiguous anchors; --force is accepted but no longer needed.");
     }
   }
   return args;
@@ -920,7 +1077,7 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
   if (!looksLikeZCodeRoot(installationRoot(archive), process.platform))
     throw new Error("Target is not a ZCode installation");
   if (args.command === "wait") return waitForUnlock(archive);
-  if (args.command === "add-version") return addVersion(archive, args, write);
+  if (args.command === "verify") return verifyCommand(archive, write);
   // Plans only; the archive handle closes before any replacement is attempted,
   // so Windows never sees our own handle blocking the atomic rename.
   const fd = fs.openSync(archive, "r");
@@ -949,9 +1106,8 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
       }
       deployed = deploy();
     }
-    const targets = loadTargets(args.targets || TARGETS_PATH, args.command !== "remove");
-    if (args.command === "remove") plan = removePlan(fd, nodes, base, targets, version, args.force);
-    else plan = installPlan(fd, nodes, base, targets, version);
+    if (args.command === "remove") plan = removePlan(fd, nodes, base, version);
+    else plan = installPlan(fd, nodes, base, version, args.registry);
   } finally {
     fs.closeSync(fd);
   }
@@ -992,17 +1148,18 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
 }
 
 module.exports = {
-  BLOCK, BRIDGE_RE, ESSENTIAL_FILES, FEATURES, FINAL_STATE, LOADER_RE, MAIN, MIN_ZCODE_VERSION,
-  MIN_ZCODE_VERSION_TEXT, RUNTIME_FILES, TARGETS_PATH,
+  BLOCK, BRIDGE_MARK, BRIDGE_RE, ESSENTIAL_FILES, FEATURES, FINAL_STATE, LOADER_RE, MAIN,
+  MIN_ZCODE_VERSION, MIN_ZCODE_VERSION_TEXT, RUNTIME_FILES,
   hooks, setRuntime,
-  sha, readHeader, listFiles, readFileNode, loadTargets, stamp, stampEquals, fileSha, asset, deploy,
+  sha, readHeader, listFiles, readFileNode, stamp, stampEquals, fileSha, asset, deploy,
   parseRegistryExport, registryInstallRoots, installRootsFor, asarInRoot, looksLikeZCodeRoot,
   findZcodeAsar, installationRoot, saveStatus, purgeRuntime, pendingPaths,
   parseMeta, serializeJsonWithStamp, ensureNoPending, waitForUnlock,
   winQuote, waiterArgv, waiterCommandLine, spawnDetachedWaiter, startWaiterCim, startWaiter,
-  readVersion, requireSupportedVersion, rendererAssets, scanBridgeAsset, readRegisteredAsset,
-  toFileUri, loaderLine, installPlan, removePlan, stripBridge, cleanAsset, syntaxCheck, integrity, repack,
-  verifyRepack, apply, contextSnippets, addVersion, parseArgs, main,
+  readVersion, requireSupportedVersion, rendererAssets, contextSnippets,
+  toFileUri, loaderLine, stripBridge, bridgeFor, detectStoreAsset, verifyRegistryCandidate, scanRendererStore,
+  installPlan, removePlan, syntaxCheck, integrity, repack,
+  verifyRepack, apply, verifyCommand, parseArgs, main,
 };
 
 if (require.main === module) {

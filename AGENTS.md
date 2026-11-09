@@ -5,7 +5,7 @@
 ```text
 skill/zcode-speed-repair/
 ├── SKILL.md             # 安装、检查、卸载入口
-└── scripts/             # 运行源码与版本配置
+└── scripts/             # 运行源码
 repair-speed.cjs         # 根命令入口
 speed.test.cjs           # 测速、桥接、界面测试
 install.test.cjs         # 安装器测试（合成 ASAR、三平台布局、旧版产物兼容）
@@ -19,8 +19,7 @@ install.test.cjs         # 安装器测试（合成 ASAR、三平台布局、旧
 - ASAR 只通过 `repair-speed.cjs` 修改，保留备份、语法检查、逐文件校验、原子替换和注入标记。
 - 注入标记与 loader 行是跨版本契约：改写前先确认旧安装（含历史 Python 安装器产物）仍能被识别、升级和卸载。
 - pending 元数据的 `originalStamp` 是 JSON 数字数组（size、mtimeNs、ino）；mtimeNs 超出 Number 精度，必须经 `parseMeta`/`serializeJsonWithStamp` 无损读写，旧 Python waiter 才能接续。
-- targets.json 条目含 `platform` 字段；缺省视为 `win32`（历史登记均为 Windows 验证）。`add-version` 记录当前平台，其他平台须单独适配登记。
-- 新版本先验证再登记，不绕过指纹校验。
+- 安装时自动适配新版本，无按版本登记：store 结构特征定位资源，`layer:new`/`stale:!1`/`R.set` 组合锚点识别 registry 变量，每位点独立验证；候选不一致即拒绝，`--registry` 兜底只救锚点歧义且给定名字仍须过结构校验；store 特征缺失时任何参数都不得安装。最低支持 3.17.1。
 - 有未完成替换时，完全退出 ZCode 并等待；不要覆盖待替换文件或提前删除运行目录。CIM waiter 创建失败会降级为 `detached-fallback` 并在报告中给出手动接续命令。
 
 ## 验证

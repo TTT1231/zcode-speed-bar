@@ -1,6 +1,6 @@
 /* zspeed-bridge:v1 begin */
-// Appended inside the verified renderer module by repair-speed.py. Only numeric
-// row summaries cross this bridge; host stores and message text remain private.
+// Appended inside the renderer store module found by repair-speed.cjs. Only
+// numeric row summaries cross this bridge; host stores and message text remain private.
 ;(() => {
   const registry = __ZSPEED_REGISTRY__;
   const generations = new WeakMap(), counts = new WeakMap(), childLeases = new Map();

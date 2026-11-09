@@ -14,10 +14,31 @@ const ROOT_ENTRY = path.join(__dirname, "repair-speed.cjs");
 const ASSET = "out/renderer/assets/bundle.js";
 const MAIN = "out/main/index.js";
 const VERSION = "3.17.1";
+// A synthetic renderer store module: real shape, valid JS (the wanted bytes
+// must survive `node --check`). One valid registry site for J1, plus the two
+// decoy shapes seen in real bundles: a hook call site with `layer:new` but no
+// stale flag or set, and a second registry whose secondary anchor is
+// same-shaped but never holds a `layer:new` entry.
+const STORE_ASSET = [
+  "var J1=new Map;",
+  "var Q1=class{constructor(t){this.transport=t;this.entries=new Map;this.disposed=!1}",
+  "acquire(e){if(this.disposed)throw Error(`released`);let r={store:e,refCount:1};this.entries.set(e,r);return r}",
+  "release(e){this.entries.delete(e)}};",
+  "function conn(t,k){k=`w`;let s;(s={layer:new Q1(t),refCount:1,keepWarmTimer:null,stale:!1},J1.set(k,s));" +
+    "J1.delete(k),s.stale=!0;return s}",
+  "function hook(n){return{layer:new Q1({transport:n}),sendCommand:e=>e}};",
+  "var uO=new Map;function scope(e){let t;(t={key:e,refCount:1,stale:!1},uO.set(e,t));" +
+    "uO.delete(e),t.stale=!0;return t}",
+  "var productTurnId=0,rowId=0,logEpoch=0,assistantText=0,projectionReady=0;",
+].join("\n");
+// A second fully valid registry site on the same class: detection must refuse.
+const RIVAL_STORE_ASSET = STORE_ASSET + "\n" +
+  "function conn2(t,k){k=`w`;let s;(s={layer:new Q1(t),refCount:1,keepWarmTimer:null,stale:!1},K2.set(k,s));" +
+  "K2.delete(k),s.stale=!0;return s}\nvar K2=new Map;";
 const ORIGINAL = {
   "package.json": Buffer.from(JSON.stringify({ version: VERSION })),
   [MAIN]: Buffer.from("console.log('synthetic main');"),
-  [ASSET]: Buffer.from("var np = new Map();"),
+  [ASSET]: Buffer.from(STORE_ASSET),
   "unrelated/data.bin": Buffer.from([0x00, 0x01, ...Buffer.from("unchanged"), 0xff]),
 };
 
@@ -122,14 +143,6 @@ function fixture(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const skill = path.join(root, "standalone skill");
   fs.cpSync(SKILL, skill, { recursive: true });
-  const targets = path.join(skill, "scripts", "targets.json");
-  fs.writeFileSync(targets, JSON.stringify({ [VERSION]: {
-    asset: ASSET,
-    assetSha256: sha(ORIGINAL[ASSET]),
-    main: MAIN,
-    mainSha256: sha(ORIGINAL[MAIN]),
-    registry: "np",
-  } }, null, 2));
   const home = path.join(root, "home");
   fs.mkdirSync(home);
   const runtime = path.join(home, ".zcode", "zcode-speed");
@@ -138,7 +151,7 @@ function fixture(t) {
   fs.writeFileSync(path.join(installation, "ZCode.exe"), "");
   const archive = path.join(installation, "resources", "app.asar");
   makeAsar(archive, ORIGINAL);
-  return { root, skill, targets, home, runtime, installation, archive };
+  return { root, skill, home, runtime, installation, archive };
 }
 
 function cli(f, command, extraArgs = [], expected = 0,
@@ -180,6 +193,7 @@ test("copied skill installs, checks and removes without the repository", t => {
   const patched = unpackAsar(f.archive);
   assert.ok(patched["unrelated/data.bin"].equals(ORIGINAL["unrelated/data.bin"]));
   assert.ok(patched[ASSET].includes("zspeed-bridge:v1 begin"));
+  assert.ok(patched[ASSET].includes("const registry = J1;"), "the detected registry must be bound");
   assert.ok(patched[MAIN].includes("inject-main.cjs"));
   const backups = fs.readdirSync(path.join(f.runtime, "backups")).filter(name => name.includes("-host-"));
   assert.strictEqual(backups.length, 1);
@@ -200,12 +214,13 @@ test("copied skill installs, checks and removes without the repository", t => {
   assert.strictEqual(fs.existsSync(f.runtime), false);
 });
 
-test("wrong renderer fingerprint never changes the archive", t => {
+test("a renderer without the store shape never changes the archive", t => {
   const f = fixture(t);
-  makeAsar(f.archive, { ...ORIGINAL, [ASSET]: Buffer.from("var np = new Map(); // modified") });
+  makeAsar(f.archive, { ...ORIGINAL, [ASSET]: Buffer.from("var x = 1;") });
   const before = fs.readFileSync(f.archive);
   const result = cli(f, "install", [], 1);
-  assert.ok(result.stderr.includes("fingerprint mismatch"), result.stderr);
+  assert.ok(result.stderr.includes("store shape was not found"), result.stderr);
+  assert.ok(result.stderr.includes("productTurnId"), result.stderr);
   assert.ok(fs.readFileSync(f.archive).equals(before));
 });
 
@@ -220,18 +235,13 @@ test("minimum version uses numeric and prerelease ordering", t => {
   }
 });
 
-test("old version cannot be installed, checked or registered even if listed", t => {
+test("old version cannot be installed or checked", t => {
   const f = fixture(t);
   const oldVersion = "3.17.0";
   makeAsar(f.archive, { ...ORIGINAL,
     "package.json": Buffer.from(JSON.stringify({ version: oldVersion })) });
-  const targets = JSON.parse(fs.readFileSync(f.targets, "utf8"));
-  targets[oldVersion] = targets[VERSION];
-  fs.writeFileSync(f.targets, JSON.stringify(targets));
   const beforeArchive = fs.readFileSync(f.archive);
-  const beforeTargets = fs.readFileSync(f.targets);
-  for (const [command, args] of [["install", ["--force"]], ["deploy", []], ["check", []],
-    ["add-version", ["--registry", "np", "--force"]]]) {
+  for (const [command, args] of [["install", ["--force"]], ["deploy", []], ["check", []]]) {
     const result = cli(f, command, args, 1);
     if (command === "install" || command === "deploy") {
       const report = JSON.parse(result.stdout);
@@ -241,7 +251,6 @@ test("old version cannot be installed, checked or registered even if listed", t 
       assert.ok(result.stderr.includes("below the minimum supported version 3.17.1"), result.stderr);
     }
     assert.ok(fs.readFileSync(f.archive).equals(beforeArchive), command);
-    assert.ok(fs.readFileSync(f.targets).equals(beforeTargets), command);
     assert.strictEqual(fs.existsSync(f.runtime), false, command);
   }
 });
@@ -294,28 +303,68 @@ test("deploy checks the version before copying runtime files", t => {
     .equals(fs.readFileSync(path.join(f.skill, "scripts", "inject-main.cjs"))));
 });
 
-test("newer version still needs registration", t => {
+test("newer versions install from the same store shape without registration", t => {
   const f = fixture(t);
   makeAsar(f.archive, { ...ORIGINAL,
     "package.json": Buffer.from(JSON.stringify({ version: "3.18.0" })) });
-  const result = cli(f, "install", [], 1);
-  assert.ok(result.stderr.includes("has no verified speed bridge"), result.stderr);
+  const installed = JSON.parse(cli(f, "install").stdout);
+  assert.deepStrictEqual([installed.state, installed.pending], ["installed", false]);
+  assert.ok(unpackAsar(f.archive)[ASSET].includes("const registry = J1;"));
 });
 
-test("supported versions can be registered after feature checks", t => {
+test("verify reports the adaptation read-only", t => {
   const f = fixture(t);
-  const asset = "var np, productTurnId, rowId, logEpoch, assistantText, projectionReady;";
-  for (const version of ["3.17.1", "3.18.0"]) {
-    makeAsar(f.archive, { ...ORIGINAL,
-      "package.json": Buffer.from(JSON.stringify({ version })), [ASSET]: Buffer.from(asset) });
-    fs.writeFileSync(f.targets, "{}");
-    const report = JSON.parse(cli(f, "add-version", ["--registry", "np"]).stdout);
-    assert.strictEqual(report.registered, version);
-    const registered = JSON.parse(fs.readFileSync(f.targets, "utf8"))[version];
-    assert.strictEqual(registered.assetSha256, sha(Buffer.from(asset)));
-    assert.strictEqual(registered.platform, process.platform);
-    assert.strictEqual(fs.existsSync(f.runtime), false);
-  }
+  const ready = JSON.parse(cli(f, "verify").stdout);
+  assert.strictEqual(ready.stage, "ready");
+  assert.strictEqual(ready.registry, "J1");
+  assert.strictEqual(ready.layerClass, "Q1");
+  assert.strictEqual(ready.ok, true);
+  makeAsar(f.archive, { ...ORIGINAL, [ASSET]: Buffer.from("var x = 1;") });
+  const noShape = JSON.parse(cli(f, "verify", [], 1).stdout);
+  assert.strictEqual(noShape.stage, "features");
+  assert.deepStrictEqual(noShape.missing.sort(), [..."productTurnId,rowId,logEpoch,assistantText,projectionReady".split(",")].sort());
+  assert.strictEqual(noShape.ok, false);
+  assert.strictEqual(fs.existsSync(f.runtime), false, "verify must not deploy");
+  makeAsar(f.archive, ORIGINAL);
+  cli(f, "install");
+  const injected = JSON.parse(cli(f, "verify").stdout);
+  assert.strictEqual(injected.stage, "injected");
+  assert.strictEqual(injected.registry, "J1");
+  assert.strictEqual(injected.ok, true);
+});
+
+test("ambiguous anchors refuse, --registry rescues only with valid structure", t => {
+  const f = fixture(t);
+  makeAsar(f.archive, { ...ORIGINAL, [ASSET]: Buffer.from(RIVAL_STORE_ASSET) });
+  const before = fs.readFileSync(f.archive);
+  const refused = cli(f, "install", [], 1);
+  assert.ok(refused.stderr.includes("Ambiguous registry candidates"), refused.stderr);
+  assert.ok(refused.stderr.includes("J1") && refused.stderr.includes("K2"), refused.stderr);
+  assert.ok(fs.readFileSync(f.archive).equals(before));
+  const badName = cli(f, "install", ["--registry", "NOPE"], 1);
+  assert.ok(badName.stderr.includes("Ambiguous registry candidates"), badName.stderr);
+  assert.ok(fs.readFileSync(f.archive).equals(before));
+  const installed = JSON.parse(cli(f, "install", ["--registry", "J1"]).stdout);
+  assert.strictEqual(installed.state, "installed");
+  assert.ok(unpackAsar(f.archive)[ASSET].includes("const registry = J1;"));
+});
+
+test("detection accepts declaration-form classes and older-version shapes", t => {
+  const f = fixture(t);
+  const mod = loadScript(f.skill);
+  // 3.17.1-era bundles may declare the layer as `class X` instead of `X=class`.
+  const declared = [
+    "var J1=new Map;",
+    "class Q1{constructor(t){this.transport=t;this.entries=new Map;this.disposed=!1}",
+    "acquire(e){if(this.disposed)throw Error(`x`);let r={store:e,refCount:1};this.entries.set(e,r);return r}}",
+    "function conn(t,k){k=`w`;let s;(s={layer:new Q1(t),refCount:1,keepWarmTimer:null,stale:!1},J1.set(k,s));" +
+      "J1.delete(k),s.stale=!0;return s}",
+    "var productTurnId=0,rowId=0,logEpoch=0,assistantText=0,projectionReady=0;",
+  ].join("\n");
+  const result = mod.detectStoreAsset(declared);
+  assert.deepStrictEqual(
+    { stage: result.stage, registry: result.registry, layerClass: result.layerClass },
+    { stage: "ready", registry: "J1", layerClass: "Q1" });
 });
 
 test("removal can clean an older version", t => {
@@ -324,56 +373,31 @@ test("removal can clean an older version", t => {
   const contents = unpackAsar(f.archive);
   contents["package.json"] = Buffer.from(JSON.stringify({ version: "3.17.0" }));
   makeAsar(f.archive, contents);
-  const targets = JSON.parse(fs.readFileSync(f.targets, "utf8"));
-  targets["3.17.0"] = targets[VERSION];
-  fs.writeFileSync(f.targets, JSON.stringify(targets));
   assert.strictEqual(JSON.parse(cli(f, "remove").stdout).state, "removed");
   assertArchiveEquals(f.archive, { ...ORIGINAL, "package.json": contents["package.json"] });
   assert.strictEqual(fs.existsSync(f.runtime), false);
 });
 
-test("root compatibility entry installs with explicit targets", t => {
+test("root compatibility entry installs without extra arguments", t => {
   const f = fixture(t);
-  const result = cli(f, "install", ["--targets", f.targets], 0, ROOT_ENTRY);
+  const result = cli(f, "install", [], 0, ROOT_ENTRY);
   assert.strictEqual(JSON.parse(result.stdout).state, "installed");
   assert.ok(unpackAsar(f.archive)[ASSET].includes("zspeed-bridge:v1 begin"));
 });
 
-test("unregistered version is not registered or installed", t => {
-  const f = fixture(t);
-  fs.writeFileSync(f.targets, "{}");
-  const before = fs.readFileSync(f.archive);
-  const result = cli(f, "install", [], 1);
-  assert.ok(result.stderr.includes("compatibility must be checked"), result.stderr);
-  assert.ok(fs.readFileSync(f.archive).equals(before));
-  assert.strictEqual(fs.readFileSync(f.targets, "utf8"), "{}");
-});
-
-test("remove rejects a changed registered renderer", t => {
+test("remove works after the renderer changed post-install", t => {
   const f = fixture(t);
   cli(f, "install");
   const changed = unpackAsar(f.archive);
   changed[ASSET] = Buffer.concat([changed[ASSET], Buffer.from("\n// unexpected host modification")]);
   makeAsar(f.archive, changed);
-  const before = fs.readFileSync(f.archive);
-  const result = cli(f, "remove", ["--force"], 1);
-  assert.ok(result.stderr.includes("clean fingerprint"), result.stderr);
-  assert.ok(fs.readFileSync(f.archive).equals(before));
-  assert.strictEqual(fs.existsSync(f.runtime), true);
-});
-
-test("unregistered forced removal retains backups", t => {
-  const f = fixture(t);
-  cli(f, "install");
-  fs.writeFileSync(f.targets, "{}");
-  const before = fs.readFileSync(f.archive);
-  cli(f, "remove", [], 1);
-  assert.ok(fs.readFileSync(f.archive).equals(before));
   const removed = JSON.parse(cli(f, "remove", ["--force"]).stdout);
-  assert.ok(removed.runtimeDir.includes("backups/ kept"), removed.runtimeDir);
-  assertArchiveEquals(f.archive, ORIGINAL);
-  assert.deepStrictEqual(fs.readdirSync(f.runtime), ["backups"]);
-  assert.ok(fs.readdirSync(path.join(f.runtime, "backups")).some(name => name.includes("-injected-")));
+  assert.deepStrictEqual([removed.state, removed.pending], ["removed", false]);
+  const cleaned = unpackAsar(f.archive)[ASSET].toString("latin1");
+  assert.ok(!cleaned.includes("zspeed-bridge:v1 begin"), "the marker must be stripped");
+  assert.ok(cleaned.includes("unexpected host modification"), "foreign bytes stay untouched");
+  assert.ok(!unpackAsar(f.archive)[MAIN].toString("latin1").includes("inject-main.cjs"));
+  assert.strictEqual(fs.existsSync(f.runtime), false);
 });
 
 test("pending remove reports the current state and cleans only after replace", t => {
@@ -550,10 +574,10 @@ test("an install written by the old Python tool is recognized, upgraded and remo
   assert.ok(fs.readFileSync(f.archive).equals(stable));
   const removed = JSON.parse(cli(f, "remove").stdout);
   assert.strictEqual(removed.state, "removed");
-  assertArchiveEquals(f.archive, ORIGINAL);
+  assertArchiveEquals(f.archive, { ...ORIGINAL, [ASSET]: clean });
 });
 
-test("darwin and linux layouts are discovered and unregistered platforms are refused", t => {
+test("darwin and linux layouts are discovered", t => {
   const f = fixture(t);
   const mod = loadScript(f.skill);
   const darwinRoot = path.join(f.root, "ZCode.app");
@@ -572,21 +596,6 @@ test("darwin and linux layouts are discovered and unregistered platforms are ref
   mod.hooks.installRoots = platform => platform === "linux" ? [linuxRoot] : [];
   assert.strictEqual(mod.findZcodeAsar("linux"), linuxAsar);
   assert.strictEqual(mod.looksLikeZCodeRoot(linuxRoot, "linux"), true);
-  // The registered entry predates the platform field and means win32; other
-  // platforms must be refused before anything is read as installable.
-  const targets = JSON.parse(fs.readFileSync(f.targets, "utf8"));
-  const fd = fs.openSync(f.archive, "r");
-  try {
-    const [header, base] = mod.readHeader(fd);
-    const nodes = Object.fromEntries(mod.listFiles(header));
-    for (const platform of ["darwin", "linux"]) {
-      assert.throws(() => mod.installPlan(fd, nodes, base, targets, VERSION, platform),
-        /verified on win32/, platform);
-    }
-    assert.ok(mod.installPlan(fd, nodes, base, targets, VERSION, "win32"));
-  } finally {
-    fs.closeSync(fd);
-  }
 });
 
 test("reg.exe export parsing picks zcode install locations in any value order", t => {
