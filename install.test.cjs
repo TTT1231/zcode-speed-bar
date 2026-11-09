@@ -367,6 +367,53 @@ test("detection accepts declaration-form classes and older-version shapes", t =>
     { stage: "ready", registry: "J1", layerClass: "Q1" });
 });
 
+// A hypothetical next release: new identifier allocation, `class extends`,
+// reordered entry properties, statement separator and an inline literal store.
+// An a1->a2 upgrade must adapt from the structure alone, with no registration.
+const FUTURE_STORE_ASSET = [
+  "const zw=new Map;",
+  "var Qk=class extends Object{constructor(r){super();this.transport=r;this.entries=new Map;this.disposed=!1}",
+  "lookup(e){return this.entries.get(e)}",
+  "acquire(e){if(this.disposed)throw Error(`no`);let r={store:e,refCount:1};this.entries.set(e,r);return r}",
+  "drop(e){this.entries.delete(e)}};",
+  "var k=`conn`;",
+  "function wire(r){let e={layer:new Qk(r),stale:!1,refCount:1};zw.set(k,e);return e}",
+  "function arm(r){return zw.set(k,{layer:new Qk(r),refCount:1,stale:!1})}",
+  "function reap(key){let e=zw.get(key);zw.delete(key),e.stale=!0}",
+  "function hook(r){return{layer:new Qk({transport:r}),send:(...a)=>a}};",
+  "var productTurnId=0,rowId=0,logEpoch=0,assistantText=0,projectionReady=0;",
+].join("\n");
+
+test("a future-version upgrade adapts from the structure alone", t => {
+  const f = fixture(t);
+  makeAsar(f.archive, { ...ORIGINAL,
+    "package.json": Buffer.from(JSON.stringify({ version: "4.2.0" })),
+    [ASSET]: Buffer.from(FUTURE_STORE_ASSET) });
+  const installed = JSON.parse(cli(f, "install").stdout);
+  assert.deepStrictEqual([installed.state, installed.pending], ["installed", false]);
+  assert.ok(unpackAsar(f.archive)[ASSET].includes("const registry = zw;"),
+    "the new release's registry variable must be bound");
+  const removed = JSON.parse(cli(f, "remove").stdout);
+  assert.strictEqual(removed.state, "removed");
+  assert.ok(!unpackAsar(f.archive)[ASSET].toString("latin1").includes("zspeed-bridge:v1 begin"));
+});
+
+test("a genuine store refactor refuses safely with diagnostics", t => {
+  const f = fixture(t);
+  makeAsar(f.archive, { ...ORIGINAL,
+    "package.json": Buffer.from(JSON.stringify({ version: "4.2.0" })),
+    [ASSET]: Buffer.from(FUTURE_STORE_ASSET.replace("productTurnId", "turnRef")) });
+  const before = fs.readFileSync(f.archive);
+  const result = cli(f, "install", [], 1);
+  assert.ok(result.stderr.includes("store shape was not found"), result.stderr);
+  assert.ok(result.stderr.includes("productTurnId"), result.stderr);
+  assert.ok(fs.readFileSync(f.archive).equals(before));
+  const report = JSON.parse(cli(f, "verify", [], 1).stdout);
+  assert.strictEqual(report.stage, "features");
+  assert.deepStrictEqual(report.missing, ["productTurnId"]);
+  assert.ok(report.snippets && report.snippets.rowId, "context snippets aid the port");
+});
+
 test("removal can clean an older version", t => {
   const f = fixture(t);
   cli(f, "install");

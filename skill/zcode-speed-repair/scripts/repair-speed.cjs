@@ -572,24 +572,36 @@ function findObjectOpen(text, from, limit) {
 }
 
 // One `layer:new X(` site becomes a candidate only when it sits in an object
-// that is flagged `stale:!1` and stored via `R.set(owner, entry)` — the exact
-// lifecycle the bridge depends on. Call sites in hooks or components (no flag,
-// no set) fail here instead of producing false candidates.
+// that is flagged `stale:!1` and stored via `R.set` — the exact lifecycle the
+// bridge depends on. The flag may sit anywhere in the object, and the store
+// may pass an assigned entry (`...},R.set(key,owner)` / `...};R.set(...)`) or
+// an inline literal (`R.set(key,{...})`). Call sites in hooks or components
+// (no flag, no set) fail here instead of producing false candidates. Property
+// order and minified identifier names are free to change between releases.
 function validateAnchorSite(text, index, layerClass, failures) {
   const fail = reason => {
     if (failures && !failures.reason) failures.reason = reason;
     return null;
   };
   const close = findObjectClose(text, index, 600);
-  if (close < 0 || text.slice(close - 8, close) !== "stale:!1")
-    return fail("no `stale:!1` object holding `layer:new`");
-  const setCall = /^,([A-Za-z_$][\w$]*)\.set\(([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?),([A-Za-z_$][\w$]*)\)/
-    .exec(text.slice(close + 1, close + 100));
-  if (!setCall) return fail("the entry object is not stored via `R.set(`");
+  if (close < 0) return fail("no object close after `layer:new`");
   const open = findObjectOpen(text, index, 600);
-  const registry = setCall[1];
-  if (open && open.owner && setCall[3] !== open.owner)
-    return fail(`\`${registry}.set(\` stores a different object than the \`${layerClass}\` entry`);
+  if (!open) return fail("no object open before `layer:new`");
+  if (!text.slice(open.open, close + 1).includes("stale:!1"))
+    return fail("no `stale:!1` object holding `layer:new`");
+  const rest = text.slice(close + 1, close + 120);
+  let registry = null;
+  const stored = /^([,;])([A-Za-z_$][\w$]*)\.set\(([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?),([A-Za-z_$][\w$]*)\)/.exec(rest);
+  if (stored) {
+    if (open.owner && stored[4] !== open.owner)
+      return fail(`\`${stored[2]}.set(\` stores a different object than the \`${layerClass}\` entry`);
+    registry = stored[2];
+  } else if (rest[0] === ")") {
+    // Inline literal: the `R.set(key,` call opens immediately before the object.
+    const inline = /([A-Za-z_$][\w$]*)\.set\([^,]{1,60},$/.exec(text.slice(Math.max(0, open.open - 120), open.open));
+    if (inline) registry = inline[1];
+  }
+  if (!registry) return fail("the entry object is not stored via `R.set(`");
   const esc = escapeIdent(registry);
   if (!new RegExp("(?:^|[^\\w$])" + esc + "=new Map\\b").test(text))
     return fail(`\`${registry}\` has no \`=new Map\` declaration`);
