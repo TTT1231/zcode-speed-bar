@@ -1,37 +1,15 @@
 "use strict";
-/* Manage the speed bar injected into ZCode's app.asar. The default command is check.
- *
- * The files beside this script are the source of truth. Machine-local state and deployed runtime
- * files live in ~/.zcode/zcode-speed. install and deploy sync the runtime files; remove
- * also syncs them before stripping the recognized bridge and loader. Removal
- * normally cleans the runtime directory. Running this script from inside that
- * directory preserves it.
- *
- * app.asar is located automatically per platform: the Windows uninstall registry
- * (via reg.exe) and common install roots; on macOS and Linux the standard app
- * layouts. Pass --asar to override. The platform is only detected at runtime to
- * pick installation paths; the adaptation itself reads the archive contents and
- * is platform-independent. The minimum supported ZCode version is 3.17.1.
- *
- * Adaptation is automatic, with no per-version registration: install scans the
- * renderer assets once for the store shape (FEATURES in speed-bridge.js) and
- * identifies the registry variable from structural anchors whose property names
- * survive minification (layer:new, stale, R.set). Every anchor site is verified
- * on its own; candidates must agree, or install refuses. --registry overrides
- * detection only when the anchors are ambiguous, and a given name must still
- * pass the structural checks. verify reports the detection read-only.
- *
- * The injected bridge carries the zspeed-bridge:v1 marker; remove finds it
- * without any registry, so installs by this tool or by the older Python one are
- * always recognized and strippable. Pending metadata keeps originalStamp as a
- * JSON number array (size, mtimeNs, ino) so an older Python waiter can still
- * read it; mtimeNs exceeds Number precision, so it is serialized and parsed
- * digit-exactly.
+/* Manage the speed bar injected into ZCode's app.asar.
+ * Installation detects the renderer store from structural anchors. Ambiguous
+ * anchors require a structurally verified --registry; missing store features
+ * prevent installation. verify reports detection without changing files.
+ * Pending replacement metadata preserves originalStamp's integer precision.
  */
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
+const { pathToFileURL } = require("url");
 const { spawn, spawnSync } = require("child_process");
 
 const SRC = __dirname;                                             // bundled files (source of truth)
@@ -39,9 +17,7 @@ let RUNTIME = path.join(os.homedir(), ".zcode", "zcode-speed");    // deployed c
 const MAIN = "out/main/index.js";
 const BRIDGE_MARK = "zspeed-bridge:v1 begin";
 const BRIDGE_RE = /\n?\/\* zspeed-bridge:v1 begin \*\/[\s\S]*?\/\* zspeed-bridge:v1 end \*\/\n?/g;
-// The bridge template's first line binds the registry; substituted installs
-// always carry this exact shape, so the variable can be read back from any
-// install made by this tool or its Python predecessor.
+// Read the substituted registry binding from an injected bridge.
 const REGISTRY_LINE_RE = /const registry = ([A-Za-z_$][\w$]*);/;
 // Matches a zusage loader line from any runtime directory (the directory can
 // move between installs), so a new install never leaves a stale line behind.
@@ -49,12 +25,10 @@ const LOADER_RE = /\n;import\("[^"]*inject-main\.cjs"\)\.then\(\(\) => null, \(e
 // Store-shape evidence a candidate bundle must still contain for the bridge to
 // work (contract in speed-bridge.js). Generic keys are useless as a gate.
 const FEATURES = ["productTurnId", "rowId", "logEpoch", "assistantText", "projectionReady"];
-const MIN_ZCODE_VERSION = [3, 17, 1];
 const BLOCK = 4194304;
 const RUNTIME_FILES = ["inject-main.cjs", "speed-bridge.js", "repair-speed.cjs"];
 const ESSENTIAL_FILES = ["inject-main.cjs", "speed-bridge.js"];
 const FINAL_STATE = { install: "installed", remove: "removed" };
-const MIN_ZCODE_VERSION_TEXT = MIN_ZCODE_VERSION.join(".");
 const COMMANDS = ["install", "remove", "check", "wait", "deploy", "verify"];
 
 // Indirection points for tests: swap replaceFile to simulate the host's file
@@ -140,7 +114,6 @@ function fileSha(target) {
 }
 
 function asset(name) {
-  // The bundled source is the only baseline; deploy() keeps the runtime copies equal to it.
   return path.join(SRC, name);
 }
 
@@ -187,7 +160,7 @@ function parseRegistryExport(text) {
 }
 
 function registryInstallRoots() {
-  // Install roots advertised by ZCode's Windows uninstall entries (NSIS writes these).
+  // Install roots advertised by ZCode's Windows uninstall entries.
   const roots = [];
   if (process.platform !== "win32") return roots;
   const key = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
@@ -211,8 +184,10 @@ function installRootsFor(platform) {
   if (platform === "win32") {
     const roots = [...registryInstallRoots()];
     if (process.env.LOCALAPPDATA) roots.push(path.join(process.env.LOCALAPPDATA, "Programs", "ZCode"));
-    roots.push(path.join(os.homedir(), "AppData", "Local", "Programs", "ZCode"),
-      "C:\\Program Files\\ZCode", "C:\\Program Files (x86)\\ZCode", "D:\\soft\\ZCode");
+    roots.push(path.join(os.homedir(), "AppData", "Local", "Programs", "ZCode"));
+    for (const directory of [process.env.ProgramFiles, process.env["ProgramFiles(x86)"]]) {
+      if (directory) roots.push(path.join(directory, "ZCode"));
+    }
     return roots;
   }
   if (platform === "darwin") {
@@ -283,14 +258,11 @@ function saveStatus(fields) {
 }
 
 function purgeRuntime(keepBackups) {
-  // Delete the runtime directory once nothing injected is left that might need restoring.
-  // keepBackups only arrives from old pending metadata written before an
-  // unverified --force strip existed; current removals are always verified.
+  // Retain backups if pending metadata requests them for manual rollback.
   if (!fs.existsSync(RUNTIME)) return "already absent";
   if (path.resolve(SRC) === path.resolve(RUNTIME))
     return "kept: this script runs inside it; delete the directory manually";
   if (keepBackups) {
-    // Unverified strip: keep the backups for manual rollback, drop everything else.
     for (const child of fs.readdirSync(RUNTIME)) {
       if (child === "backups") continue;
       const childPath = path.join(RUNTIME, child);
@@ -311,7 +283,7 @@ const ORIGINAL_STAMP_RE = /"originalStamp"\s*:\s*\[([^\]]*)\]/;
 
 function parseMeta(text) {
   // JSON.parse alone loses mtimeNs precision, so originalStamp is re-read from
-  // the raw text digit-exactly. Both old Python and new Node metadata parse.
+  // the raw text digit-exactly.
   const meta = JSON.parse(text);
   const match = text.match(ORIGINAL_STAMP_RE);
   if (!match) throw new Error("Pending metadata lacks originalStamp");
@@ -323,9 +295,7 @@ function parseMeta(text) {
 }
 
 function serializeJsonWithStamp(meta) {
-  // originalStamp must stay a JSON number array (an older Python waiter reads
-  // it), but its digits exceed Number precision. Positional placeholders, one
-  // strictly validated single-occurrence replacement each, no global dequoting.
+  // Write full-precision integer digits as JSON numbers without global dequoting.
   const stampValues = meta.originalStamp;
   if (!Array.isArray(stampValues) || stampValues.length !== 3 ||
       !stampValues.every(value => typeof value === "bigint"))
@@ -463,41 +433,13 @@ function startWaiter(archive) {
   return { pid: spawnDetachedWaiter(archive), mode: "detached" };
 }
 
-const VERSION_RE =
-  /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
-
 function readVersion(fd, nodes, base) {
   try {
-    return JSON.parse(readFileNode(fd, nodes, base, "package.json").toString("utf8")).version;
-  } catch (error) {
-    throw unsupportedVersion("unrecognized-version", "Cannot read the ZCode version from package.json");
+    const version = JSON.parse(readFileNode(fd, nodes, base, "package.json").toString("utf8"))?.version;
+    return typeof version === "string" && version ? version : null;
+  } catch (_) {
+    return null;
   }
-}
-
-function unsupportedVersion(reason, message) {
-  const error = new Error(message);
-  error.reason = reason;
-  return error;
-}
-
-function requireSupportedVersion(version) {
-  // Reject releases below the minimum, including its prerelease versions.
-  const minimum = MIN_ZCODE_VERSION_TEXT;
-  const match = VERSION_RE.exec(typeof version === "string" ? version.replace(/^v/, "") : "");
-  if (!match)
-    throw unsupportedVersion("unrecognized-version",
-      `Cannot determine whether ZCode version ${JSON.stringify(version)} meets the minimum ${minimum}`);
-  const release = [Number(match[1]), Number(match[2]), Number(match[3])];
-  const order = (a, b) => {
-    for (let index = 0; index < 3; index++) {
-      if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
-    }
-    return 0;
-  };
-  const comparison = order(release, MIN_ZCODE_VERSION);
-  if (comparison < 0 || (comparison === 0 && match[4] !== undefined))
-    throw unsupportedVersion("version-too-low",
-      `ZCode ${version} is below the minimum supported version ${minimum}; the ASAR was not changed`);
 }
 
 function rendererAssets(nodes) {
@@ -523,8 +465,7 @@ function stripBridge(text) {
 }
 
 function bridgeFor(registry) {
-  // The bundled bridge is the only baseline; the registry variable is the one
-  // per-version datum, resolved by detection or an explicit --registry.
+  // Substitute the registry selected by structural detection.
   return fs.readFileSync(asset("speed-bridge.js")).toString("latin1")
     .replaceAll("__ZSPEED_REGISTRY__", () => registry);
 }
@@ -686,8 +627,7 @@ function scanRendererStore(fd, nodes, base) {
 }
 
 function unsupportedStoreError(scan, manualRegistry) {
-  // Error text per failure stage. --registry only rescues anchor ambiguity or
-  // a changed anchor shape; it cannot help when the store shape is gone.
+  // --registry can resolve ambiguous candidates only after structural checks.
   if (scan.featuresMissing) {
     const missing = scan.featuresMissing.missing.join(", ");
     return new Error("The renderer store shape was not found (missing: " + missing +
@@ -717,41 +657,20 @@ function extractInjectedRegistry(text) {
   return match ? match[1] : null;
 }
 
-function toFileUri(archivePath) {
-  // Byte-compatible replacement for Python's Path.as_uri(): quote everything
-  // except A-Za-z0-9_.-~/ (and the drive colon), uppercase hex, UTF-8 bytes.
-  // Node's pathToFileURL keeps ()'!$&+,;=: raw, which older installs never wrote.
-  let p = String(archivePath).replace(/\\/g, "/");
-  let prefix;
-  if (p.startsWith("//")) { p = p.slice(2); prefix = "file://"; }
-  else if (/^[A-Za-z]:/.test(p)) prefix = "file:///";
-  else if (p.startsWith("/")) prefix = "file://";
-  else throw new Error("relative path can't be expressed as a file URI");
-  let out = "";
-  let index = 0;
-  for (const ch of p) {
-    const keep = /[A-Za-z0-9_.\-~/]/.test(ch) || (index === 1 && ch === ":" && /^[A-Za-z]:/.test(p));
-    if (keep) out += ch;
-    else for (const byte of Buffer.from(ch, "utf8")) out += "%" + byte.toString(16).toUpperCase().padStart(2, "0");
-    index++;
-  }
-  return prefix + out;
-}
-
 function loaderLine(runtime = RUNTIME) {
-  const url = toFileUri(path.join(runtime, "inject-main.cjs"));
+  const url = pathToFileURL(path.join(runtime, "inject-main.cjs")).href;
   return "\n;import(" + JSON.stringify(url) + ").then(() => null, " +
     '(e) => console.error("[zusage] load failed", e));';
 }
 
-function installPlan(fd, nodes, base, version, manualRegistry) {
+function installPlan(fd, nodes, base, manualRegistry) {
   const scan = scanRendererStore(fd, nodes, base);
   if (scan.injected.length > 1)
     throw new Error("Multiple injected renderer assets found; refusing to guess; the ASAR was not changed");
   const oldMain = readFileNode(fd, nodes, base, MAIN);
   const oldMainText = oldMain.toString("latin1");
   const line = loaderLine();
-  // Already injected counts regardless of the trailing newline older tools left out.
+  // Accept the loader with or without its trailing newline.
   const found = [...oldMainText.matchAll(LOADER_RE)].map(match => match[0]);
   const loaderPresent = found.length === 1 && (found[0] === line || found[0] === line + "\n");
   const wantedMain = loaderPresent ? oldMainText : oldMainText.replace(LOADER_RE, "") + line + "\n";
@@ -807,8 +726,6 @@ function removePlan(fd, nodes, base) {
     old[assetPath] = oldAsset;
     wanted[assetPath] = Buffer.from(stripBridge(oldAsset.toString("latin1")), "latin1");
   }
-  // Verified whenever the marker confirmed the clean result or nothing of ours
-  // was in the renderer at all; only that keeps the unconditional runtime purge.
   return {
     assetPath, old, wanted, verified: true,
     present: { bridge: assetPath !== null && !old[assetPath].equals(wanted[assetPath]),
@@ -944,7 +861,7 @@ function apply(archive, intent, version, old, changes, report, purgeAfter, write
     `${now.getFullYear()}${pad2(now.getMonth() + 1)}${pad2(now.getDate())}-` +
     `${pad2(now.getHours())}${pad2(now.getMinutes())}${pad2(now.getSeconds())}-` +
     `${String(now.getMilliseconds()).padStart(3, "0")}` +
-    `-${intent === "install" ? "host" : "injected"}-${version}`);
+    `-${intent === "install" ? "host" : "injected"}`);
   fs.mkdirSync(path.dirname(backup), { recursive: true });
   fs.mkdirSync(backup);
   for (const name of Object.keys(changes)) {
@@ -1007,19 +924,13 @@ function apply(archive, intent, version, old, changes, report, purgeAfter, write
 }
 
 function verifyCommand(archive, write) {
-  // Read-only adaptation report: what would install target and why. No
-  // deploy, no pending check, no minimum-version gate; exit 0 only when
-  // install would find a target (ready or injected).
-  const report = { asar: archive, minimumVersion: MIN_ZCODE_VERSION_TEXT, command: "verify" };
+  // Report structural detection without deploying files or checking pending work.
+  const report = { asar: archive, command: "verify" };
   const fd = fs.openSync(archive, "r");
   try {
     const [header, base] = readHeader(fd);
     const nodes = Object.fromEntries(listFiles(header));
-    try {
-      report.version = readVersion(fd, nodes, base);
-    } catch (_) {
-      report.version = null;
-    }
+    report.version = readVersion(fd, nodes, base);
     const scan = scanRendererStore(fd, nodes, base);
     if (scan.injected.length) {
       report.stage = "injected";
@@ -1099,15 +1010,7 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
   try {
     const [header, base] = readHeader(fd);
     const nodes = Object.fromEntries(listFiles(header));
-    try {
-      version = readVersion(fd, nodes, base);
-      if (args.command !== "remove") requireSupportedVersion(version);
-    } catch (error) {
-      if (error.reason === undefined || !["install", "deploy"].includes(args.command)) throw error;
-      write(JSON.stringify({ state: "skipped", reason: error.reason, version: version ?? null,
-        minimumVersion: MIN_ZCODE_VERSION_TEXT, asar: archive, message: error.message }, null, 2) + "\n");
-      return 1;
-    }
+    version = readVersion(fd, nodes, base);
     if (args.command !== "check") {
       // deploy, install and remove all refuse to race a pending replacement.
       ensureNoPending(archive);
@@ -1118,8 +1021,8 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
       }
       deployed = deploy();
     }
-    if (args.command === "remove") plan = removePlan(fd, nodes, base, version);
-    else plan = installPlan(fd, nodes, base, version, args.registry);
+    if (args.command === "remove") plan = removePlan(fd, nodes, base);
+    else plan = installPlan(fd, nodes, base, args.registry);
   } finally {
     fs.closeSync(fd);
   }
@@ -1161,15 +1064,15 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
 
 module.exports = {
   BLOCK, BRIDGE_MARK, BRIDGE_RE, ESSENTIAL_FILES, FEATURES, FINAL_STATE, LOADER_RE, MAIN,
-  MIN_ZCODE_VERSION, MIN_ZCODE_VERSION_TEXT, RUNTIME_FILES,
+  RUNTIME_FILES,
   hooks, setRuntime,
   sha, readHeader, listFiles, readFileNode, stamp, stampEquals, fileSha, asset, deploy,
   parseRegistryExport, registryInstallRoots, installRootsFor, asarInRoot, looksLikeZCodeRoot,
   findZcodeAsar, installationRoot, saveStatus, purgeRuntime, pendingPaths,
   parseMeta, serializeJsonWithStamp, ensureNoPending, waitForUnlock,
   winQuote, waiterArgv, waiterCommandLine, spawnDetachedWaiter, startWaiterCim, startWaiter,
-  readVersion, requireSupportedVersion, rendererAssets, contextSnippets,
-  toFileUri, loaderLine, stripBridge, bridgeFor, detectStoreAsset, verifyRegistryCandidate, scanRendererStore,
+  readVersion, rendererAssets, contextSnippets,
+  loaderLine, stripBridge, bridgeFor, detectStoreAsset, verifyRegistryCandidate, scanRendererStore,
   installPlan, removePlan, syntaxCheck, integrity, repack,
   verifyRepack, apply, verifyCommand, parseArgs, main,
 };

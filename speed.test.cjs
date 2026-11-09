@@ -2,11 +2,13 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const os = require("node:os");
+const { pathToFileURL } = require("node:url");
 const path = require("node:path");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 const sourceDir = path.join(__dirname, "skill", "zcode-speed-repair", "scripts");
-const { createSpeedMeter, rendererSource, VERSION } = require(path.join(sourceDir, "inject-main.cjs"));
+const { createSpeedMeter, rendererSource } = require(path.join(sourceDir, "inject-main.cjs"));
 const head = (extra = {}) => ({ id: 1, turnId: "t1", kind: "turnHeader", state: "running", chars: 0, ...extra });
 const text = (chars, extra = {}) => ({ id: 2, turnId: "t1", kind: "assistantText", chars, ...extra });
 const snap = (chars, extra = {}) => ({ sessionId: "s1", epoch: "e1", generation: 1, phase: "running",
@@ -445,7 +447,6 @@ test("the speed capsule drags horizontally, keeps its place per run and recenter
   assert.equal(f.store.has("zspeed-bar-offset"), false);
   const capsule = f.barFor(f.pane);
   assert.equal(capsule.style.transform, "translateX(calc(-50% + 0px))");
-  assert.ok(capsule.title.includes("可左右拖动，双击复位"));
   fire(capsule, "pointerdown", pointer(250));
   fire(capsule, "pointermove", pointer(447));
   assert.equal(capsule.style.transform, "translateX(calc(-50% + 197px))");
@@ -654,12 +655,12 @@ test("older bridges sample an auxiliary chat before it receives focus", () => {
   assert.equal(f.barFor(auxiliaryPane)?.children[1].textContent, "200.0");
 });
 
-test("replacing a renderer version disposes every conversation's old bar", () => {
+test("replacing a renderer script disposes every conversation's old bar", () => {
   const f = rendererFixture();
   const auxiliaryPane = f.addPane("child", "selection-side-chat:workspace:s1:child");
   vm.runInContext(f.source, f.context);
   const oldMainBar = f.barFor(f.pane), oldAuxiliaryBar = f.barFor(auxiliaryPane);
-  f.window.__ZSPEED_VERSION__ = "old-version";
+  f.window.__ZSPEED_VERSION__ = "different-script";
   vm.runInContext(f.source, f.context);
   assert.equal(oldMainBar.isConnected, false);
   assert.equal(oldAuxiliaryBar.isConnected, false);
@@ -686,24 +687,29 @@ test("older bridges keep sampling previously visited conversations", () => {
   assert.equal(f.window.__ZSPEED_TICK__().tps, 200);
 });
 
-test("main clock drives 500ms renderer sampling and only injects local host windows", async () => {
+test("main clock drives 500ms renderer sampling and only injects local host windows", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "zspeed-renderer-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const resources = path.join(root, "resources");
   const f = rendererFixture();
   const app = new EventEmitter();
   let callback, interval, reads = 0;
   const mainWindow = new EventEmitter();
   Object.assign(mainWindow, { id: 1, isDestroyed: () => false, getType: () => "window",
-    getURL: () => "file:///D:/soft/ZCode/resources/app.asar/out/renderer/index.html",
+    getURL: () => pathToFileURL(path.join(resources, "app.asar", "out", "renderer", "index.html")).href,
     executeJavaScript: async source => { reads++; return vm.runInContext(source, f.context); } });
   const external = new EventEmitter();
   Object.assign(external, { ...mainWindow, id: 2, getURL: () => "https://example.org/",
     executeJavaScript: () => { throw new Error("must not inject external page"); } });
   const outside = new EventEmitter();
-  Object.assign(outside, { ...mainWindow, id: 3, getURL: () => "file:///D:/soft/ZCode/resources-other/private.html",
+  Object.assign(outside, { ...mainWindow, id: 3, getURL: () => pathToFileURL(path.join(root, "resources-other", "private.html")).href,
     executeJavaScript: () => { throw new Error("must not inject outside resources"); } });
-  const mockProcess = { versions: {}, type: "browser", resourcesPath: "D:\\soft\\ZCode\\resources", pid: 1 };
+  const mockProcess = { versions: {}, type: "browser", resourcesPath: resources, pid: 1 };
   const context = vm.createContext({ module: { exports: {} }, process: mockProcess, __dirname,
+    __filename: path.join(sourceDir, "inject-main.cjs"),
     require: name => name === "electron" ? { app, webContents: { getAllWebContents: () => [mainWindow, external, outside] } }
-      : name === "fs" ? { appendFile: (_p, _s, done) => done(), writeFile: (_p, _s, done) => done() } : require(name),
+      : name === "fs" ? { readFileSync: fs.readFileSync, appendFile: (_p, _s, done) => done(),
+        writeFile: (_p, _s, done) => done() } : require(name),
     setInterval: (fn, ms) => { callback = fn; interval = ms; return { unref() {} }; }, clearInterval() {} });
   vm.runInContext(fs.readFileSync(path.join(sourceDir, "inject-main.cjs"), "utf8"), context);
   context.module.exports.install();

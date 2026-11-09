@@ -6,10 +6,12 @@
  * Main and auxiliary conversations each display a bar inside their own pane.
  * Bars drag horizontally inside their pane; main and side keep their own in-memory offsets.
  * repair-speed.cjs installs the small read-only bridge after a ZCode upgrade.
- * Reference: ByteRax/zcode-token-usage-statusbar, renderer bridge for 3.17.1.
+ * Reference: ByteRax/zcode-token-usage-statusbar renderer bridge.
  */
 "use strict";
-const VERSION = "store-speed-10";
+// Identify the actual deployed script without a manually maintained version.
+const SCRIPT_ID = require("crypto").createHash("sha256")
+  .update(require("fs").readFileSync(__filename)).digest("hex");
 const REFRESH_MS = 500;
 
 // Self-contained: the same calculation runs in Electron and regression tests.
@@ -170,7 +172,6 @@ function rendererMain(makeMeter, version) {
         ? Math.max(0, paneWidth / 2 - barWidth / 2 - 8) : null;
     } catch (_) { return null; }
   }
-  // The host's pane contract, in one place.
   const PANE_SELECTOR = '[data-testid^="v4-session-pane-"][data-session-id]';
   function roleOf(pane) {
     return pane.getAttribute("data-testid") === "v4-session-pane-workspace-main" ? "main" : "side";
@@ -294,7 +295,6 @@ function rendererMain(makeMeter, version) {
     const label = tps === null ? "—" : tps.toFixed(1);
     return { tps, label,
       band: tps === null || tps === 0 ? "idle" : tps >= 70 ? "fast" : tps >= 40 ? "medium" : "slow",
-      title: tps === null ? "正在采样生成速度" : result.est ? "实时估算速度 · 每 0.5 秒刷新" : "最近完成一轮的生成速度",
       aria: tps === null ? "正在采样生成速度" : (result.est ? "生成速度约 " : "生成速度 ") + label + " token/s" };
   }
   function ensureAgent(summary) {
@@ -340,7 +340,6 @@ function rendererMain(makeMeter, version) {
       badge.textContent = info.label + " t/s";
       badge.setAttribute("data-speed-band", info.band);
       badge.setAttribute("data-zspeed-theme", theme);
-      badge.title = info.title;
       badge.setAttribute("aria-label", info.aria);
     }
   }
@@ -379,7 +378,6 @@ function rendererMain(makeMeter, version) {
         entry.signature = next;
         value.textContent = info.label;
         bar.setAttribute("data-speed-band", info.band);
-        bar.title = info.title + " · 可左右拖动，双击复位";
         bar.setAttribute("aria-label", info.aria);
       }
       showAgents(pane, bySession.get(pane.getAttribute("data-session-id")), theme, seenAgents);
@@ -387,7 +385,7 @@ function rendererMain(makeMeter, version) {
     for (const [summary, badge] of agentBars) if (!seenAgents.has(summary)) {
       badge.remove(); agentBars.delete(summary);
     }
-    // Keep the existing diagnostic status focused on the selected conversation.
+    // Report the selected conversation in diagnostic status.
     return { ...meter.get(sid), bridge: hasBridge, tickAt: Date.now() };
   }
   document.addEventListener("pointerdown", rememberPane, true);
@@ -409,22 +407,22 @@ function rendererMain(makeMeter, version) {
   return tick();
 }
 
-// Built once here so the regression tests exercise the exact injected payload.
+// Build the renderer payload from the same functions used by tests.
 function rendererSource() {
-  return "(" + rendererMain.toString() + ")(" + createSpeedMeter.toString() + "," + JSON.stringify(VERSION) + ")";
+  return "(" + rendererMain.toString() + ")(" + createSpeedMeter.toString() + "," + JSON.stringify(SCRIPT_ID) + ")";
 }
 
 function install() {
-  if (globalThis.__ZSPEED_LOADED__ === VERSION) return;
+  if (globalThis.__ZSPEED_LOADED__ === SCRIPT_ID) return;
   if (typeof globalThis.__ZSPEED_MAIN_DISPOSE__ === "function") globalThis.__ZSPEED_MAIN_DISPOSE__();
-  globalThis.__ZSPEED_LOADED__ = VERSION;
+  globalThis.__ZSPEED_LOADED__ = SCRIPT_ID;
   const electron = require("electron");
   const fs = require("fs");
   const path = require("path");
   const { fileURLToPath } = require("url");
   const source = rendererSource();
-  // Constant per install(); rebuilding it every tick would churn ~15KB of strings.
-  const js = "window.__ZSPEED_VERSION__ === " + JSON.stringify(VERSION)
+  // Build the payload once per installation rather than on every tick.
+  const js = "window.__ZSPEED_VERSION__ === " + JSON.stringify(SCRIPT_ID)
     + " && typeof window.__ZSPEED_TICK__ === 'function' ? window.__ZSPEED_TICK__() : " + source;
   // Steady state only drives the already-injected bar; the full payload crosses
   // IPC again only after a load, or a tick that finds no bar to drive.
@@ -469,7 +467,7 @@ function install() {
     for (const wc of electron.webContents.getAllWebContents()) tickWindow(wc);
     if (Date.now() - lastStatus >= 5000) {
       lastStatus = Date.now();
-      const status = { version: VERSION, pid: process.pid, intervalMs: REFRESH_MS, updatedAt: lastStatus,
+      const status = { scriptId: SCRIPT_ID, pid: process.pid, intervalMs: REFRESH_MS, updatedAt: lastStatus,
         windows: Array.from(states, ([id, state]) => ({ id, ...state })) };
       fs.writeFile(path.join(__dirname, "status.json"), JSON.stringify(status, null, 2), () => {});
     }
@@ -489,8 +487,8 @@ function install() {
   }
   globalThis.__ZSPEED_MAIN_DISPOSE__ = dispose;
   electron.app.on("before-quit", dispose);
-  log("loaded " + VERSION + " pid=" + process.pid + " refresh=" + REFRESH_MS + "ms source=renderer-store");
+  log("loaded " + SCRIPT_ID + " pid=" + process.pid + " refresh=" + REFRESH_MS + "ms source=renderer-store");
 }
 
-module.exports = { createSpeedMeter, rendererMain, rendererSource, install, VERSION, REFRESH_MS };
+module.exports = { createSpeedMeter, rendererMain, rendererSource, install, SCRIPT_ID, REFRESH_MS };
 if (process.versions.electron && process.type === "browser") install();

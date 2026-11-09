@@ -1,6 +1,6 @@
 /* zspeed-bridge:v1 begin */
-// Appended inside the renderer store module found by repair-speed.cjs. Only
-// numeric row summaries cross this bridge; host stores and message text remain private.
+// Summarize renderer stores without exposing message text or store objects.
+// Snapshots also contain session identifiers, states and agent links.
 ;(() => {
   const registry = __ZSPEED_REGISTRY__;
   const generations = new WeakMap(), counts = new WeakMap(), childLeases = new Map();
@@ -9,7 +9,6 @@
   function codePoints(text, from = 0) {
     let length = 0;
     for (let index = from; index < text.length; index++) {
-      // A high surrogate paired with a low surrogate is one code point.
       if ((text.charCodeAt(index) & 0xFC00) === 0xD800 &&
           (text.charCodeAt(index + 1) & 0xFC00) === 0xDC00) index++;
       length++;
@@ -34,7 +33,6 @@
     counts.set(row, { text, length });
     return length;
   }
-  // The only element satisfying match, or null when none or several match.
   const sole = (list, match) => {
     const found = list.filter(match);
     return found.length === 1 ? found[0] : null;
