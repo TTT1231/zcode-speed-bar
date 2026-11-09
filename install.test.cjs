@@ -56,7 +56,7 @@ const AS_URI_FIXTURES = [
   ["D:\\mid:path\\ZCode", "file:///D:/mid%3Apath/ZCode"],
   ["D:\\tilde~dot.dash-_dir\\ZCode", "file:///D:/tilde~dot.dash-_dir/ZCode"],
   ["D:\\caret^backtick`dir\\ZCode", "file:///D:/caret%5Ebacktick%60dir/ZCode"],
-  ["C:\\Users\\Tu1231\\.zcode\\zcode-speed", "file:///C:/Users/Tu1231/.zcode/zcode-speed"],
+  ["C:\\Users\\someone\\.zcode\\zcode-speed", "file:///C:/Users/someone/.zcode/zcode-speed"],
 ];
 
 function sha(data) {
