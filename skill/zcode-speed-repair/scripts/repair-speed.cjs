@@ -28,8 +28,8 @@ const FEATURES = ["productTurnId", "rowId", "logEpoch", "assistantText", "projec
 const BLOCK = 4194304;
 const RUNTIME_FILES = ["inject-main.cjs", "speed-bridge.js", "repair-speed.cjs"];
 const ESSENTIAL_FILES = ["inject-main.cjs", "speed-bridge.js"];
-const FINAL_STATE = { install: "installed", remove: "removed" };
-const COMMANDS = ["install", "remove", "check", "wait", "deploy", "verify"];
+const FINAL_STATE = { install: "installed", uninstall: "uninstalled" };
+const COMMANDS = ["install", "uninstall", "check", "wait", "deploy", "verify"];
 
 // Indirection points for tests: swap replaceFile to simulate the host's file
 // lock, spawnWaiter to skip the background process, installRoots to inject
@@ -64,7 +64,7 @@ function readAt(fd, position, length) {
 function readHeader(fd) {
   const head = readAt(fd, 0, 16);
   if (head.length !== 16) throw new Error("Invalid ASAR header");
-  const a = head.readUInt32LE(0), b = head.readUInt32LE(4), c = head.readUInt32LE(8), d = head.readUInt32LE(12);
+  const a = head.readUInt32LE(0), b = head.readUInt32LE(4), d = head.readUInt32LE(12);
   if (a !== 4 || d > b || b > 100000000) throw new Error("Invalid ASAR header");
   return [JSON.parse(readAt(fd, 16, d).toString("utf8")), 8 + b];
 }
@@ -268,10 +268,10 @@ function purgeRuntime(keepBackups) {
       const childPath = path.join(RUNTIME, child);
       fs.rmSync(childPath, { recursive: true, force: true });
     }
-    return "cleared; backups/ kept for manual rollback (unverified --force strip)";
+    return "cleared; backups/ kept for manual rollback (unverified strip)";
   }
   fs.rmSync(RUNTIME, { recursive: true, force: true });
-  return fs.existsSync(RUNTIME) ? `not fully deleted; remove ${RUNTIME} manually` : "purged";
+  return fs.existsSync(RUNTIME) ? `not fully deleted; delete ${RUNTIME} manually` : "purged";
 }
 
 function pendingPaths(archive) {
@@ -311,21 +311,39 @@ function serializeJsonWithStamp(meta) {
   return text;
 }
 
-function ensureNoPending(archive) {
+function discardPending(archive) {
+  // install/uninstall take over any unfinished replacement (the last command
+  // wins), then plan from app.asar as it is now: the staged file was never
+  // applied, so dropping it leaves app.asar exactly as the plan will read it. Metadata goes first so a still-running waiter exits quietly
+  // (see waitForUnlock) instead of recording "cancelled" over our result.
   const [metaPath, pending] = pendingPaths(archive);
-  if (fs.existsSync(metaPath) || fs.existsSync(pending))
-    throw new Error(
-      "An unfinished pending replacement exists. Fully exit ZCode and wait for " +
-      "the existing operation to finish; do not start another one. If it does " +
-      `not finish, inspect ${metaPath} and install-status.json before changing ${pending}.`);
+  if (!fs.existsSync(metaPath) && !fs.existsSync(pending)) return null;
+  let intent = "unknown";
+  try { intent = parseMeta(fs.readFileSync(metaPath, "utf8")).intent || "install"; } catch {}
+  fs.rmSync(metaPath, { force: true });
+  fs.rmSync(pending, { force: true });
+  return intent;
+}
+
+function ensureNoPending(archive) {
+  // Only deploy refuses; install and uninstall take an unfinished job over.
+  const [metaPath, pending] = pendingPaths(archive);
+  if (!fs.existsSync(metaPath) && !fs.existsSync(pending)) return;
+  throw new Error("A previous install or uninstall has not finished. Run \"install\" or " +
+    "\"uninstall\" to take it over, or fully exit ZCode and wait for it to finish.");
 }
 
 function waitForUnlock(archive) {
   // Finish this specific, verified repair when the running app releases ASAR.
   archive = path.resolve(archive);
   const [metaPath] = pendingPaths(archive);
-  const meta = parseMeta(fs.readFileSync(metaPath, "utf8"));
+  const metaText = fs.readFileSync(metaPath, "utf8");
+  const meta = parseMeta(metaText);
   const pending = meta.pending;
+  // A later install/uninstall replaced or discarded this job and owns the status file.
+  const takenOver = () => {
+    try { return fs.readFileSync(metaPath, "utf8") !== metaText; } catch { return true; }
+  };
   if (path.resolve(meta.asar) !== archive || path.resolve(meta.runtime) !== path.resolve(RUNTIME) ||
       path.dirname(pending) !== path.dirname(archive) ||
       path.basename(pending) !== path.basename(archive) + ".zspeed.pending")
@@ -340,16 +358,19 @@ function waitForUnlock(archive) {
       currentStamp = stamp(pending);
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
+      if (takenOver()) return 1;
       saveStatus({ state: "cancelled", reason: "Pending repair was deleted; old files were kept" });
       return 1;
     }
     if (!stampEquals(stamp(archive), meta.originalStamp) || !stampEquals(currentStamp, pendingStamp)) {
+      if (takenOver()) return 1;
       saveStatus({ state: "cancelled", reason: "ZCode or the pending repair changed; old files were not applied" });
       return 1;
     }
     try {
       hooks.replaceFile(pending, archive);
     } catch (error) {
+      if (error.code === "ENOENT") continue; // taken over mid-attempt; the next pass decides
       if (error.code !== "EPERM" && error.code !== "EBUSY") throw error;
       sleepSync(500);
       continue;
@@ -358,7 +379,7 @@ function waitForUnlock(archive) {
       backup: meta.backup, restartRequired: true });
     fs.rmSync(metaPath, { force: true });
     const purge = meta.purge;
-    if (purge && meta.intent === "remove") purgeRuntime(purge.keepBackups);
+    if (purge && meta.intent === "uninstall") purgeRuntime(purge.keepBackups);
     return 0;
   }
   saveStatus({ state: "waiting-expired", reason: "ZCode did not release the file within 24 hours" });
@@ -713,7 +734,7 @@ function installPlan(fd, nodes, base, manualRegistry) {
   };
 }
 
-function removePlan(fd, nodes, base) {
+function uninstallPlan(fd, nodes, base) {
   // The bridge marker is the proof of our injection; no registry or force is
   // needed to strip it, whatever else changed in the asset since.
   let assetPath = null, oldAsset = null;
@@ -856,7 +877,7 @@ function verifyRepack(source, destination, changes) {
 }
 
 function apply(archive, intent, version, old, changes, report, purgeAfter, write) {
-  // Shared install/remove pipeline: backup, repack, verify, replace or pend.
+  // Shared install/uninstall pipeline: backup, repack, verify, replace or pend.
   const originalStamp = stamp(archive);
   const now = new Date();
   const pad2 = value => String(value).padStart(2, "0");
@@ -973,12 +994,12 @@ function verifyCommand(archive, write) {
 }
 
 function parseArgs(argv) {
-  const args = { command: "check", force: false };
+  const args = { command: "check", debug: false };
   let commandSeen = false;
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
-    if (arg === "--force") {
-      args.force = true; // accepted for compatibility; removal no longer needs it
+    if (arg === "--debug") {
+      args.debug = true;
     } else if (["--asar", "--registry", "--runtime"].includes(arg)) {
       const value = argv[++index];
       if (value === undefined) throw new Error(`${arg} requires a value`);
@@ -988,12 +1009,85 @@ function parseArgs(argv) {
       commandSeen = true;
     } else {
       throw new Error(`Unknown argument: ${arg}\n` +
-        "Usage: repair-speed.cjs [install|remove|check|wait|deploy|verify] " +
-        "[--asar path] [--runtime dir] [--registry name] [--force]\n" +
-        "--registry overrides detection only for ambiguous anchors; --force is accepted but no longer needed.");
+        "Usage: repair-speed.cjs [install|uninstall|check|verify|wait|deploy] " +
+        "[--asar path] [--runtime dir] [--registry name] [--debug]\n" +
+        "--debug prints the full report (and stack traces) instead of a one-line outcome.\n" +
+        "--registry overrides detection only for ambiguous anchors.");
     }
   }
   return args;
+}
+
+function summarize(command, report, code) {
+  // One short, human-readable outcome per command; --debug keeps the full report.
+  const host = report.version ? `ZCode ${report.version}` : "ZCode";
+  const what = report.intent === "uninstall" ? "Uninstall" : "Install";
+  const lines = [];
+  if (report.discardedPending) {
+    const job = FINAL_STATE[report.discardedPending] ? report.discardedPending : "replacement";
+    lines.push(`Took over an unfinished ${job} that had not taken effect.`);
+  }
+  if (command === "wait") {
+    const status = report.status || {};
+    // A completed removal may have purged the runtime directory with its status file.
+    const change = { installed: "install", uninstalled: "uninstall" }[status.state] || "change";
+    if (code === 0) lines.push(`Done: the pending ${change} was applied. Start ZCode.`);
+    else lines.push(`Not applied: ${status.reason || "see install-status.json"}.`);
+  } else if (command === "verify") {
+    lines.push(report.ok
+      ? `Supported: ${host} matches the expected structure` +
+        (report.stage === "injected" ? " (speed bar already installed)." : ".")
+      : `Not supported: ${host} failed structure detection at "${report.stage}". Run with --debug for details.`);
+  } else if (command === "deploy") {
+    lines.push(`Runtime files updated in ${report.runtime}.`);
+  } else if (command === "check") {
+    if (report.pending)
+      lines.push(`Pending: a previous change is waiting for ZCode to exit (${host}). ` +
+        "Fully quit ZCode, or rerun \"install\" or \"uninstall\" to take it over.");
+    else if (report.bridge && report.loader && code === 0)
+      lines.push(`Installed: the speed bar is active in ${host}.`);
+    else if (report.bridge || report.loader)
+      lines.push(`Incomplete: ${host} is partly patched. Run "install" to repair it.`);
+    else lines.push(`Not installed in ${host}. Run "install" to add the speed bar.`);
+  } else if (report.state === "pending-until-ZCode-exits") {
+    lines.push(`${what} is ready and will finish when ZCode exits (${host}).`,
+      "Fully quit ZCode (including the tray icon), then start it again.");
+    if (report.waiter === "detached-fallback")
+      lines.push("If it does not finish, run after this tool exits:", "  " + report.manualContinue);
+  } else if (report.state === "installed") {
+    lines.push(report.alreadyInstalled
+      ? `Already installed in ${host}. Nothing to do.`
+      : `Install succeeded (${host}). Restart ZCode to see the speed bar.`);
+  } else if (report.state === "uninstalled") {
+    lines.push(report.alreadyClean
+      ? `Uninstall succeeded: ${host} has no speed bar left.`
+      : `Uninstall succeeded (${host}). Restart ZCode to finish.`);
+  }
+  if (typeof report.runtimeDir === "string" && /manually|kept/.test(report.runtimeDir))
+    lines.push(`Note: runtime directory ${report.runtimeDir}.`);
+  return lines.join("\n") + "\n";
+}
+
+// Command-line boundary: users get a one-line outcome or error, not a JSON
+// report or a Node stack trace; --debug restores both.
+function runCli(argv = process.argv.slice(2)) {
+  const debug = argv.includes("--debug");
+  try {
+    const args = parseArgs(argv);
+    if (args.debug) return main(argv);
+    let text = "";
+    const code = main(argv, chunk => { text += chunk; });
+    const report = text ? JSON.parse(text) : {};
+    if (args.command === "wait") {
+      try { report.status = JSON.parse(fs.readFileSync(path.join(RUNTIME, "install-status.json"), "utf8")); }
+      catch {}
+    }
+    process.stdout.write(summarize(args.command, report, code));
+    return code;
+  } catch (error) {
+    process.stderr.write((debug ? error.stack : "Error: " + error.message) + "\n");
+    return 1;
+  }
 }
 
 function main(argv = process.argv.slice(2), write = text => process.stdout.write(text)) {
@@ -1004,6 +1098,8 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
     throw new Error("Target is not a ZCode installation");
   if (args.command === "wait") return waitForUnlock(archive);
   if (args.command === "verify") return verifyCommand(archive, write);
+  // Before reading app.asar, so the plan reflects the file a discarded job left behind.
+  const discarded = ["install", "uninstall"].includes(args.command) ? discardPending(archive) : null;
   // Plans only; the archive handle closes before any replacement is attempted,
   // so Windows never sees our own handle blocking the atomic rename.
   const fd = fs.openSync(archive, "r");
@@ -1015,7 +1111,7 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
     const nodes = Object.fromEntries(listFiles(header));
     version = readVersion(fd, nodes, base);
     if (args.command !== "check") {
-      // deploy, install and remove all refuse to race a pending replacement.
+      // Only deploy can still meet a pending job here; install/uninstall discarded it above.
       ensureNoPending(archive);
       if (args.command === "deploy") {
         write(JSON.stringify({ version, asar: archive, source: SRC, runtime: RUNTIME,
@@ -1024,7 +1120,7 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
       }
       deployed = deploy();
     }
-    if (args.command === "remove") plan = removePlan(fd, nodes, base);
+    if (args.command === "uninstall") plan = uninstallPlan(fd, nodes, base);
     else plan = installPlan(fd, nodes, base, args.registry);
   } finally {
     fs.closeSync(fd);
@@ -1036,6 +1132,7 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
     .filter(name => !old[name].equals(wantedBytes[name]))
     .map(name => [name, wantedBytes[name]]));
   const report = { version, asar: archive, runtime: RUNTIME };
+  if (discarded) report.discardedPending = discarded;
   if (deployed.length) report.deployed = deployed;
   report.bridge = present.bridge;
   report.loader = present.loader;
@@ -1050,36 +1147,27 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
     return !Object.keys(changes).length && !report.pending ? 0 : 1;
   }
   report.pending = false;
-  if (!Object.keys(changes).length) { // install: already injected; remove: already clean
-    if (args.command === "remove") {
-      saveStatus({ state: "removed", version });
-      Object.assign(report, { state: "removed", alreadyClean: true, restartRequired: true });
-      report.runtimeDir = purgeRuntime(!verified);
+  if (!Object.keys(changes).length) { // install: already injected; uninstall: already clean
+    if (args.command === "uninstall") {
+      saveStatus({ state: "uninstalled", version });
+      Object.assign(report, { state: "uninstalled", alreadyClean: true, restartRequired: true,
+        runtimeDir: purgeRuntime(!verified) });
     } else {
       Object.assign(report, { state: "installed", alreadyInstalled: true, restartRequired: true });
     }
     write(JSON.stringify(report, null, 2) + "\n");
     return 0;
   }
-  const purgeAfter = args.command === "remove" ? { keepBackups: !verified } : null;
+  const purgeAfter = args.command === "uninstall" ? { keepBackups: !verified } : null;
   return apply(archive, args.command, version, old, changes, report, purgeAfter, write);
 }
 
+// runCli is the command-line entry; the rest exist for install.test.cjs.
 module.exports = {
-  BLOCK, BRIDGE_MARK, BRIDGE_RE, ESSENTIAL_FILES, FEATURES, FINAL_STATE, LOADER_RE, MAIN,
-  RUNTIME_FILES,
-  hooks, setRuntime,
-  sha, readHeader, listFiles, readFileNode, stamp, stampEquals, fileSha, asset, deploy,
-  parseRegistryExport, registryInstallRoots, installRootsFor, asarInRoot, looksLikeZCodeRoot,
-  findZcodeAsar, installationRoot, saveStatus, purgeRuntime, pendingPaths,
-  parseMeta, serializeJsonWithStamp, ensureNoPending, waitForUnlock,
-  winQuote, waiterArgv, waiterCommandLine, spawnDetachedWaiter, startWaiterCim, startWaiter,
-  readVersion, rendererAssets, contextSnippets,
-  loaderLine, stripBridge, bridgeFor, detectStoreAsset, verifyRegistryCandidate, scanRendererStore,
-  installPlan, removePlan, syntaxCheck, integrity, repack,
-  verifyRepack, apply, verifyCommand, parseArgs, main,
+  runCli, main, hooks, setRuntime, stamp, pendingPaths, parseMeta, serializeJsonWithStamp,
+  waitForUnlock, winQuote, parseRegistryExport, looksLikeZCodeRoot, findZcodeAsar, detectStoreAsset,
 };
 
 if (require.main === module) {
-  process.exitCode = main();
+  process.exitCode = runCli();
 }

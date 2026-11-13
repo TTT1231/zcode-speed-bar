@@ -51,7 +51,6 @@ function createSpeedMeter(singleStream = false) {
     return {
       update, sampleAll, bySessionId,
       get: sid => active.get(sid) || { sessionId: sid || "", mode: "unavailable", tps: null },
-      sessionIds: () => [...new Set(Array.from(streams.values(), entry => entry.sid))],
       reset() { streams.clear(); active.clear(); }
     };
   }
@@ -158,12 +157,7 @@ function rendererMain(makeMeter, version) {
   const meter = makeMeter();
   const bars = new Map(), agentBars = new Map(), toolTimes = new Map();
   let lastPane = null;
-  // Offsets are memory-only; drop keys written by older storage-backed builds.
-  try {
-    const storage = window.localStorage;
-    if (storage) { storage.removeItem("zspeed-bar-offset"); storage.removeItem("zspeed-bar-offsets"); }
-  } catch (_) {}
-  const offsets = new Map();
+  const offsets = new Map(); // memory-only: positions are never persisted
   function offsetLimit(bar, pane) {
     try {
       const paneWidth = pane.getBoundingClientRect().width;
@@ -385,18 +379,8 @@ function rendererMain(makeMeter, version) {
     const panes = Array.from(document.querySelectorAll(PANE_SELECTOR)).filter(visible);
     const pane = pickPane(panes);
     const sid = pane && pane.getAttribute("data-session-id");
-    const hasBridge = typeof window.__ZSPEED_READ__ === "function";
-    let snapshots = [];
-    if (typeof window.__ZSPEED_READ_ALL__ === "function") snapshots = window.__ZSPEED_READ_ALL__();
-    else if (hasBridge) {
-      // An older bridge can still keep previously visited conversations warm.
-      const known = new Set(meter.sessionIds());
-      for (const pane of panes) {
-        const sessionId = pane.getAttribute("data-session-id");
-        if (sessionId && sessionId !== "draft") known.add(sessionId);
-      }
-      snapshots = Array.from(known, sessionId => window.__ZSPEED_READ__(sessionId)).filter(Boolean);
-    }
+    const hasBridge = typeof window.__ZSPEED_READ_ALL__ === "function";
+    const snapshots = hasBridge ? window.__ZSPEED_READ_ALL__() : [];
     meter.sampleAll(snapshots, performance.now());
     const bySession = meter.bySessionId(snapshots);
     const paneSet = new Set(panes);
@@ -532,5 +516,5 @@ function install() {
   log("loaded " + SCRIPT_ID + " pid=" + process.pid + " refresh=" + REFRESH_MS + "ms source=renderer-store");
 }
 
-module.exports = { createSpeedMeter, rendererMain, rendererSource, install, SCRIPT_ID, REFRESH_MS };
+module.exports = { createSpeedMeter, rendererSource, install };
 if (process.versions.electron && process.type === "browser") install();

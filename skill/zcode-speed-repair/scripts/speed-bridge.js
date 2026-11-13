@@ -175,8 +175,5 @@
   if (typeof globalThis.__ZSPEED_RELEASE_CHILDREN__ === "function") globalThis.__ZSPEED_RELEASE_CHILDREN__();
   globalThis.__ZSPEED_RELEASE_CHILDREN__ = releaseChildren;
   globalThis.__ZSPEED_READ_ALL__ = readAll;
-  globalThis.__ZSPEED_READ__ = function (sid) {
-    return readAll().find(snapshot => snapshot.sessionId === sid) || null;
-  };
 })();
 /* zspeed-bridge:v1 end */

@@ -24,5 +24,5 @@ https://github.com/TTT1231/zcode-speed-bar/blob/main/skill/zcode-speed-repair/SK
 ## 卸载
 
 ```
-https://github.com/TTT1231/zcode-speed-bar/blob/main/skill/zcode-speed-repair/SKILL.md remove it
+https://github.com/TTT1231/zcode-speed-bar/blob/main/skill/zcode-speed-repair/SKILL.md uninstall it
 ```

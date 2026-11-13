@@ -196,34 +196,37 @@ function bridgeFixture() {
   return { context, store, entry, registry, get snapshot() { return snapshot; }, set snapshot(s) { snapshot = s; } };
 }
 
+// The bridge exposes only readAll; tests pick one conversation out of it.
+const read = (f, sid) => f.context.__ZSPEED_READ_ALL__().find(s => s.sessionId === sid) || null;
+
 test("bridge counts Unicode, reasoning and tool input while excluding user/tool output", () => {
   const f = bridgeFixture();
   f.snapshot.rows.window[3].status = "running";
   f.snapshot.rows.window[3].backgrounded = false;
   const original = JSON.stringify(f.snapshot);
-  const projection = f.context.__ZSPEED_READ__("s1");
+  const projection = read(f, "s1");
   assert.deepEqual(Array.from(projection.rows, row => row.chars), [0, 3, 2, 2, 0]);
   assert.equal(projection.rows[3].status, "running");
   assert.equal(projection.rows[3].backgrounded, false);
   assert.equal(JSON.stringify(f.snapshot), original);
   assert.doesNotMatch(JSON.stringify(projection), /do not count|中|想/);
   f.snapshot.rows.window[1].text = "中😀abcd";
-  assert.equal(f.context.__ZSPEED_READ__("s1").rows[1].chars, 6);
+  assert.equal(read(f, "s1").rows[1].chars, 6);
 });
 
 test("bridge ignores stale/closed stores and rejects ambiguous sessions", () => {
   const f = bridgeFixture();
-  assert.equal(f.context.__ZSPEED_READ__("other"), null);
+  assert.equal(read(f, "other"), null);
   f.entry.stale = true;
-  assert.equal(f.context.__ZSPEED_READ__("s1"), null);
+  assert.equal(read(f, "s1"), null);
   f.entry.stale = false;
   f.store.closed = true;
-  assert.equal(f.context.__ZSPEED_READ__("s1"), null);
+  assert.equal(read(f, "s1"), null);
   f.store.closed = false;
   f.registry.set("duplicate", { layer: { entries: new Map([["session:s1", {
     store: { getState: () => ({ snapshot: f.snapshot }) }
   }]]) } });
-  assert.equal(f.context.__ZSPEED_READ__("s1"), null);
+  assert.equal(read(f, "s1"), null);
 });
 
 function childStores(bridge, snapshots) {
@@ -257,12 +260,12 @@ test("bridge links agent tool calls by turn and parent ID and releases child lea
   const children = new Map([["child-a", childSnapshot("child-a")], ["child-b", childSnapshot("child-b")]]);
   const leases = childStores(f, children);
   const before = JSON.stringify(f.snapshot);
-  const parent = f.context.__ZSPEED_READ__("s1");
+  const parent = read(f, "s1");
   assert.deepEqual(Array.from(parent.agents, a => [a.toolCallId, a.childSessionId]), [["call-a", "child-a"], ["call-b", "child-b"]]);
   assert.deepEqual(leases.acquired, ["child-a", "child-b"]);
   assert.equal(JSON.stringify(f.snapshot), before);
   assert.doesNotMatch(JSON.stringify(parent), /private prompt|do not count|中|想/);
-  assert.ok(f.context.__ZSPEED_READ__("child-a"));
+  assert.ok(read(f, "child-a"));
   rows.find(row => row.childSessionId === "child-a").status = "completed";
   f.context.__ZSPEED_READ_ALL__();
   assert.deepEqual(leases.released, [], "a finished child's final result remains available while its row remains");
@@ -282,14 +285,14 @@ test("bridge never guesses between multiple unmatched or conflicting agent calls
     { rowId: 21, turnId: "t1", kind: "subagent", childSessionId: "child-b", status: "running" }
   );
   const leases = childStores(f, new Map([["child-a", childSnapshot("child-a")], ["child-b", childSnapshot("child-b")]]));
-  let agents = f.context.__ZSPEED_READ__("s1").agents;
+  let agents = read(f, "s1").agents;
   assert.deepEqual(Array.from(agents, a => a.childSessionId), [undefined, undefined]);
   assert.deepEqual(leases.acquired, []);
   rows[rows.length - 2].parentToolCallId = "a";
-  agents = f.context.__ZSPEED_READ__("s1").agents;
+  agents = read(f, "s1").agents;
   assert.deepEqual(Array.from(agents, a => a.childSessionId), ["child-a", "child-b"]);
   rows.push({ rowId: 22, turnId: "t1", kind: "subagent", parentToolCallId: "a", childSessionId: "child-c", status: "running" });
-  agents = f.context.__ZSPEED_READ__("s1").agents;
+  agents = read(f, "s1").agents;
   assert.equal(agents[0].childSessionId, undefined);
   assert.deepEqual(leases.released, ["child-a", "child-b"]);
   f.entry.stale = true;
@@ -304,7 +307,7 @@ test("non-agent tool calls do not receive agent speed badges", () => {
     { rowId: 20, turnId: "t1", kind: "subagent", parentToolCallId: "call-x", childSessionId: "child-x", status: "running" }
   );
   childStores(f, new Map([["child-x", childSnapshot("child-x")]]));
-  const agents = f.context.__ZSPEED_READ__("s1").agents;
+  const agents = read(f, "s1").agents;
   assert.deepEqual(Array.from(agents), []);
 });
 
@@ -394,7 +397,6 @@ function rendererFixture() {
   const bridge = bridgeFixture();
   const store = new Map();
   const window = {
-    __ZSPEED_READ__: sid => bridge.context.__ZSPEED_READ__(sid),
     __ZSPEED_READ_ALL__: () => bridge.context.__ZSPEED_READ_ALL__(),
     __ZSPEED_RELEASE_CHILDREN__: () => bridge.context.__ZSPEED_RELEASE_CHILDREN__(),
     localStorage: {
@@ -442,9 +444,7 @@ test("renderer keeps one speed-only capsule per chat, updates in place and clean
 
 test("the speed capsule drags horizontally, keeps its place per run and recenters on double click", () => {
   const f = rendererFixture();
-  f.store.set("zspeed-bar-offset", "50");
   vm.runInContext(f.source, f.context);
-  assert.equal(f.store.has("zspeed-bar-offset"), false);
   const capsule = f.barFor(f.pane);
   assert.equal(capsule.style.transform, "translateX(calc(-50% + 0px))");
   fire(capsule, "pointerdown", pointer(250));
@@ -671,20 +671,6 @@ test("auxiliary bars follow tab visibility and closing without replacing the mai
   assert.equal(f.listeners.size, 0);
 });
 
-test("older bridges sample an auxiliary chat before it receives focus", () => {
-  const f = rendererFixture();
-  delete f.window.__ZSPEED_READ_ALL__;
-  const { snapshot: auxiliary, pane: auxiliaryPane } =
-    addConversation(f, "child", "selection-side-chat:workspace:s1:child");
-  vm.runInContext(f.source, f.context);
-  f.setNow(500);
-  f.bridge.snapshot.rows.window[1].text += "a".repeat(100);
-  auxiliary.rows.window[1].text += "b".repeat(200);
-  f.window.__ZSPEED_TICK__();
-  assert.equal(f.barFor(f.pane)?.children[1].textContent, "100.0");
-  assert.equal(f.barFor(auxiliaryPane)?.children[1].textContent, "200.0");
-});
-
 test("replacing a renderer script disposes every conversation's old bar", () => {
   const f = rendererFixture();
   const auxiliaryPane = f.addPane("child", "selection-side-chat:workspace:s1:child");
@@ -701,20 +687,6 @@ test("replacing a renderer script disposes every conversation's old bar", () => 
   assert.equal(f.pane.children.length, 0);
   assert.equal(auxiliaryPane.children.length, 0);
   assert.equal(f.listeners.size, 0);
-});
-
-test("older bridges keep sampling previously visited conversations", () => {
-  const f = rendererFixture();
-  delete f.window.__ZSPEED_READ_ALL__;
-  const other = addConversation(f, "s2").snapshot;
-  vm.runInContext(f.source, f.context);
-  f.pane.attributes["data-session-id"] = "s2";
-  f.setNow(500); f.window.__ZSPEED_TICK__();
-  f.pane.attributes["data-session-id"] = "s1";
-  f.setNow(1000); other.rows.window[1].text += "b".repeat(200); f.window.__ZSPEED_TICK__();
-  f.pane.attributes["data-session-id"] = "s2";
-  f.setNow(1500); other.rows.window[1].text += "b".repeat(200);
-  assert.equal(f.window.__ZSPEED_TICK__().tps, 200);
 });
 
 test("main clock drives 500ms renderer sampling and only injects local host windows", async t => {

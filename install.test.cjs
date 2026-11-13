@@ -2,7 +2,6 @@
 /* Exercise the distributable skill against isolated synthetic ZCode installations. */
 
 const assert = require("assert");
-const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -41,10 +40,6 @@ const ORIGINAL = {
   [ASSET]: Buffer.from(STORE_ASSET),
   "unrelated/data.bin": Buffer.from([0x00, 0x01, ...Buffer.from("unchanged"), 0xff]),
 };
-
-function sha(data) {
-  return crypto.createHash("sha256").update(data).digest("hex");
-}
 
 function makeAsar(target, contents) {
   const header = { files: {} };
@@ -137,9 +132,11 @@ function fixture(t) {
   return { root, skill, home, runtime, installation, archive };
 }
 
+// Defaults to --debug so assertions read the full report; pass debug=false for the summary.
 function cli(f, command, extraArgs = [], expected = 0,
-    script = path.join(f.skill, "scripts", "repair-speed.cjs")) {
-  const result = spawnSync(process.execPath, [script, command, "--asar", f.archive, ...extraArgs], {
+    script = path.join(f.skill, "scripts", "repair-speed.cjs"), debug = true) {
+  const argv = [script, command, "--asar", f.archive, ...(debug ? ["--debug"] : []), ...extraArgs];
+  const result = spawnSync(process.execPath, argv, {
     cwd: f.root,
     env: { ...process.env, HOME: f.home, USERPROFILE: f.home },
     encoding: "utf8",
@@ -152,7 +149,7 @@ function cli(f, command, extraArgs = [], expected = 0,
 // Run a command whose archive replacement hits the simulated file lock; returns
 // the loaded module and its report. Restore hooks.replaceFile before waiting.
 function startPending(f, command) {
-  if (command === "remove") cli(f, "install");
+  if (command === "uninstall") cli(f, "install");
   const mod = loadScript(f.skill);
   mod.setRuntime(f.runtime);
   let output = "";
@@ -167,7 +164,7 @@ function startPending(f, command) {
   }];
 }
 
-test("copied skill installs, checks and removes without the repository", t => {
+test("copied skill installs, checks and uninstalls without the repository", t => {
   const f = fixture(t);
   cli(f, "check", [], 1);
   const installed = JSON.parse(cli(f, "install").stdout);
@@ -187,13 +184,13 @@ test("copied skill installs, checks and removes without the repository", t => {
   assert.ok(fs.readFileSync(f.archive).equals(afterInstall));
   const checked = JSON.parse(cli(f, "check").stdout);
   assert.ok(checked.bridge && checked.loader && !checked.pending);
-  const removed = JSON.parse(cli(f, "remove").stdout);
-  assert.deepStrictEqual([removed.state, removed.pending], ["removed", false]);
-  assert.ok(!removed.bridge && !removed.loader);
+  const uninstalled = JSON.parse(cli(f, "uninstall").stdout);
+  assert.deepStrictEqual([uninstalled.state, uninstalled.pending], ["uninstalled", false]);
+  assert.ok(!uninstalled.bridge && !uninstalled.loader);
   assertArchiveEquals(f.archive, ORIGINAL);
   assert.strictEqual(fs.existsSync(f.runtime), false);
   cli(f, "check", [], 1);
-  assert.ok(JSON.parse(cli(f, "remove").stdout).alreadyClean);
+  assert.ok(JSON.parse(cli(f, "uninstall").stdout).alreadyClean);
   assert.strictEqual(fs.existsSync(f.runtime), false);
 });
 
@@ -215,7 +212,7 @@ test("installation depends on the store shape rather than the version", t => {
     const report = JSON.parse(cli(f, "install").stdout);
     assert.strictEqual(report.state, "installed");
     assert.strictEqual(report.version, version);
-    assert.strictEqual(JSON.parse(cli(f, "remove").stdout).state, "removed");
+    assert.strictEqual(JSON.parse(cli(f, "uninstall").stdout).state, "uninstalled");
   }
 });
 
@@ -229,7 +226,7 @@ test("installation does not require a readable version", t => {
     const report = JSON.parse(cli(f, "install").stdout);
     assert.strictEqual(report.state, "installed");
     assert.strictEqual(report.version, null);
-    assert.strictEqual(JSON.parse(cli(f, "remove").stdout).state, "removed");
+    assert.strictEqual(JSON.parse(cli(f, "uninstall").stdout).state, "uninstalled");
     assertArchiveEquals(f.archive, contents);
   }
 });
@@ -333,8 +330,8 @@ test("a future-version upgrade adapts from the structure alone", t => {
   assert.deepStrictEqual([installed.state, installed.pending], ["installed", false]);
   assert.ok(unpackAsar(f.archive)[ASSET].includes("const registry = zw;"),
     "the new release's registry variable must be bound");
-  const removed = JSON.parse(cli(f, "remove").stdout);
-  assert.strictEqual(removed.state, "removed");
+  const uninstalled = JSON.parse(cli(f, "uninstall").stdout);
+  assert.strictEqual(uninstalled.state, "uninstalled");
   assert.ok(!unpackAsar(f.archive)[ASSET].toString("latin1").includes("zspeed-bridge:v1 begin"));
 });
 
@@ -354,32 +351,32 @@ test("a genuine store refactor refuses safely with diagnostics", t => {
   assert.ok(report.snippets && report.snippets.rowId, "context snippets aid the port");
 });
 
-test("removal can clean an older version", t => {
+test("uninstall can clean an older ZCode version", t => {
   const f = fixture(t);
   cli(f, "install");
   const contents = unpackAsar(f.archive);
   contents["package.json"] = Buffer.from(JSON.stringify({ version: "0.9.0" }));
   makeAsar(f.archive, contents);
-  assert.strictEqual(JSON.parse(cli(f, "remove").stdout).state, "removed");
+  assert.strictEqual(JSON.parse(cli(f, "uninstall").stdout).state, "uninstalled");
   assertArchiveEquals(f.archive, { ...ORIGINAL, "package.json": contents["package.json"] });
   assert.strictEqual(fs.existsSync(f.runtime), false);
 });
 
-test("root compatibility entry installs without extra arguments", t => {
+test("root entry installs without extra arguments", t => {
   const f = fixture(t);
   const result = cli(f, "install", [], 0, ROOT_ENTRY);
   assert.strictEqual(JSON.parse(result.stdout).state, "installed");
   assert.ok(unpackAsar(f.archive)[ASSET].includes("zspeed-bridge:v1 begin"));
 });
 
-test("remove works after the renderer changed post-install", t => {
+test("uninstall works after the renderer changed post-install", t => {
   const f = fixture(t);
   cli(f, "install");
   const changed = unpackAsar(f.archive);
   changed[ASSET] = Buffer.concat([changed[ASSET], Buffer.from("\n// unexpected host modification")]);
   makeAsar(f.archive, changed);
-  const removed = JSON.parse(cli(f, "remove", ["--force"]).stdout);
-  assert.deepStrictEqual([removed.state, removed.pending], ["removed", false]);
+  const uninstalled = JSON.parse(cli(f, "uninstall").stdout);
+  assert.deepStrictEqual([uninstalled.state, uninstalled.pending], ["uninstalled", false]);
   const cleaned = unpackAsar(f.archive)[ASSET].toString("latin1");
   assert.ok(!cleaned.includes("zspeed-bridge:v1 begin"), "the marker must be stripped");
   assert.ok(cleaned.includes("unexpected host modification"), "foreign bytes stay untouched");
@@ -387,16 +384,19 @@ test("remove works after the renderer changed post-install", t => {
   assert.strictEqual(fs.existsSync(f.runtime), false);
 });
 
-test("pending remove reports the current state and cleans only after replace", t => {
+test("pending uninstall reports the current state and cleans only after replace", t => {
   const f = fixture(t);
-  const [mod, report, restoreReplace] = startPending(f, "remove");
+  const [mod, report, restoreReplace] = startPending(f, "uninstall");
   assert.deepStrictEqual([report.state, report.pending], ["pending-until-ZCode-exits", true]);
   assert.ok(report.bridge && report.loader);
   assert.strictEqual(fs.existsSync(f.runtime), true);
   assert.ok(unpackAsar(f.archive)[ASSET].includes("zspeed-bridge:v1 begin"));
   const checked = JSON.parse(cli(f, "check", [], 1).stdout);
   assert.ok(checked.pending);
-  cli(f, "remove", [], 1);
+  const blocked = cli(f, "deploy", [], 1, undefined, false);
+  assert.strictEqual(blocked.stderr, "Error: A previous install or uninstall has not finished. " +
+    "Run \"install\" or \"uninstall\" to take it over, or fully exit ZCode and wait for it to finish.\n",
+    "without --debug a refusal is one line with no stack trace");
   assert.strictEqual(fs.existsSync(f.runtime), true);
   restoreReplace();
   assert.strictEqual(mod.waitForUnlock(f.archive), 0);
@@ -416,9 +416,69 @@ test("pending install reports the current state until replacement", t => {
   assert.ok(checked.bridge && checked.loader && !checked.pending);
 });
 
+test("uninstall takes over a stuck pending install and reports success", t => {
+  const f = fixture(t);
+  startPending(f, "install"); // its waiter never runs: the window was closed
+  const result = cli(f, "uninstall", [], 0, undefined, false);
+  assert.match(result.stdout, /^Took over an unfinished install that had not taken effect\.$/m);
+  assert.match(result.stdout, /^Uninstall succeeded: ZCode \S+ has no speed bar left\.$/m);
+  assertArchiveEquals(f.archive, ORIGINAL);
+  assert.strictEqual(fs.existsSync(f.archive + ".zspeed.pending"), false);
+  assert.strictEqual(fs.existsSync(f.runtime), false);
+});
+
+test("uninstall redoes a stuck pending uninstall", t => {
+  const f = fixture(t);
+  startPending(f, "uninstall");
+  const uninstalled = JSON.parse(cli(f, "uninstall").stdout);
+  assert.deepStrictEqual([uninstalled.state, uninstalled.discardedPending, uninstalled.pending],
+    ["uninstalled", "uninstall", false]);
+  assertArchiveEquals(f.archive, ORIGINAL);
+  assert.strictEqual(fs.existsSync(f.runtime), false);
+});
+
+test("install takes over a stuck pending uninstall", t => {
+  const f = fixture(t);
+  startPending(f, "uninstall"); // app.asar is still injected; the staged clean copy is dropped
+  const result = cli(f, "install", [], 0, undefined, false);
+  assert.match(result.stdout, /^Took over an unfinished uninstall that had not taken effect\.$/m);
+  assert.match(result.stdout, /^Already installed in ZCode \S+\. Nothing to do\.$/m);
+  assert.strictEqual(fs.existsSync(f.archive + ".zspeed.pending"), false);
+  assert.ok(JSON.parse(cli(f, "check").stdout).loader);
+});
+
+test("a waiter whose job was taken over exits without overwriting the status", t => {
+  const f = fixture(t);
+  const [mod] = startPending(f, "install");
+  const [metaPath, pending] = mod.pendingPaths(f.archive);
+  mod.hooks.replaceFile = () => { // an uninstall discards the job while the waiter is polling
+    fs.rmSync(metaPath);
+    fs.rmSync(pending);
+    throw Object.assign(new Error("simulated lock"), { code: "EPERM" });
+  };
+  assert.strictEqual(mod.waitForUnlock(f.archive), 1);
+  const status = JSON.parse(fs.readFileSync(path.join(f.runtime, "install-status.json"), "utf8"));
+  assert.notStrictEqual(status.state, "cancelled");
+  assertArchiveEquals(f.archive, ORIGINAL);
+});
+
+test("the CLI prints a one-line outcome instead of the JSON report", t => {
+  const f = fixture(t);
+  const summary = (command, expected = 0) =>
+    cli(f, command, [], expected, undefined, false).stdout.trim();
+  assert.match(summary("check", 1), /^Not installed in ZCode \S+\. Run "install"/);
+  assert.match(summary("install"), /^Install succeeded \(ZCode \S+\)\. Restart ZCode/);
+  assert.match(summary("install"), /^Already installed in ZCode \S+\. Nothing to do\.$/);
+  assert.match(summary("check"), /^Installed: the speed bar is active in ZCode \S+\.$/);
+  assert.match(summary("uninstall"), /^Uninstall succeeded \(ZCode \S+\)\. Restart ZCode/);
+  assert.match(summary("uninstall"), /^Uninstall succeeded: ZCode \S+ has no speed bar left\.$/);
+  assert.match(cli(f, "remove", [], 1, undefined, false).stderr, /^Error: Unknown argument: remove$/m,
+    "remove is not an alias of uninstall");
+});
+
 test("tampered pending file is not applied", t => {
   const f = fixture(t);
-  const [mod, , restoreReplace] = startPending(f, "remove");
+  const [mod, , restoreReplace] = startPending(f, "uninstall");
   const before = fs.readFileSync(f.archive);
   const pending = f.archive + ".zspeed.pending";
   fs.writeFileSync(pending, Buffer.concat([fs.readFileSync(pending), Buffer.from("tampered")]));
@@ -431,7 +491,7 @@ test("tampered pending file is not applied", t => {
 
 test("pending is cancelled if the original archive changes", t => {
   const f = fixture(t);
-  const [mod, , restoreReplace] = startPending(f, "remove");
+  const [mod, , restoreReplace] = startPending(f, "uninstall");
   fs.writeFileSync(f.archive, Buffer.concat([fs.readFileSync(f.archive), Buffer.from("host updated")]));
   const changed = fs.readFileSync(f.archive);
   restoreReplace();
@@ -446,7 +506,7 @@ test("removal from the runtime directory preserves its own files", t => {
   const f = fixture(t);
   cli(f, "install");
   const runtimeScript = path.join(f.runtime, "repair-speed.cjs");
-  const result = cli(f, "remove", [], 0, runtimeScript);
+  const result = cli(f, "uninstall", [], 0, runtimeScript);
   assert.ok(JSON.parse(result.stdout).runtimeDir.includes("kept: this script runs inside it"));
   assertArchiveEquals(f.archive, ORIGINAL);
   assert.strictEqual(fs.existsSync(runtimeScript), true);
@@ -461,11 +521,14 @@ test("check detects an orphaned pending file", t => {
   fs.writeFileSync(pending, "unfinished");
   const report = JSON.parse(cli(f, "check", [], 1).stdout);
   assert.ok(report.pending);
-  cli(f, "install", [], 1);
-  cli(f, "remove", [], 1);
   cli(f, "deploy", [], 1);
   assert.ok(fs.readFileSync(f.archive).equals(before));
   assert.strictEqual(fs.readFileSync(pending, "utf8"), "unfinished");
+  // No metadata means no waiter can ever apply it; uninstall clears it and proceeds.
+  const uninstalled = JSON.parse(cli(f, "uninstall").stdout);
+  assert.deepStrictEqual([uninstalled.state, uninstalled.discardedPending], ["uninstalled", "unknown"]);
+  assert.strictEqual(fs.existsSync(pending), false);
+  assertArchiveEquals(f.archive, ORIGINAL);
 });
 
 test("automatic discovery refuses multiple installations", t => {
