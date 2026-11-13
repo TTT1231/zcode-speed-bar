@@ -398,10 +398,13 @@ function spawnDetachedWaiter(archive) {
 function startWaiterCim(archive) {
   // Create the waiter outside this process tree via WMI: the new process is a
   // child of WmiPrvSE, so a Windows job object reaping this tool cannot kill it.
+  // WMI ignores windowsHide; ShowWindow=0 (SW_HIDE) keeps node.exe's console hidden.
   const commandLine = waiterCommandLine(archive);
-  const script = "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments " +
+  const script = "$si = New-CimInstance -CimClass (Get-CimClass -ClassName Win32_ProcessStartup) " +
+    "-Property @{ShowWindow=[uint16]0} -ClientOnly; " +
+    "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments " +
     "@{CommandLine='" + commandLine.replace(/'/g, "''") +
-    "'} | Select-Object -Property ReturnValue,ProcessId | ConvertTo-Json -Compress";
+    "'; ProcessStartupInformation=$si} | Select-Object -Property ReturnValue,ProcessId | ConvertTo-Json -Compress";
   const encoded = Buffer.from(script, "utf16le").toString("base64");
   const result = spawnSync("powershell.exe",
     ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
