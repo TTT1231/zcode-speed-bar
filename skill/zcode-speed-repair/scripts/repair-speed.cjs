@@ -1,10 +1,5 @@
 "use strict";
-/* Manage the speed bar injected into ZCode's app.asar.
- * Installation detects the renderer store from structural anchors. Ambiguous
- * anchors require a structurally verified --registry; missing store features
- * prevent installation. verify reports detection without changing files.
- * Pending replacement metadata preserves originalStamp's integer precision.
- */
+// Install, check and remove the speed bar injected into ZCode's app.asar.
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -27,7 +22,6 @@ const LOADER_RE = /\n;import\("[^"]*inject-main\.cjs"\)\.then\(\(\) => null, \(e
 const FEATURES = ["productTurnId", "rowId", "logEpoch", "assistantText", "projectionReady"];
 const BLOCK = 4194304;
 const RUNTIME_FILES = ["inject-main.cjs", "speed-bridge.js", "repair-speed.cjs"];
-const ESSENTIAL_FILES = ["inject-main.cjs", "speed-bridge.js"];
 const FINAL_STATE = { install: "installed", uninstall: "uninstalled" };
 const COMMANDS = ["install", "uninstall", "check", "wait", "deploy", "verify"];
 
@@ -36,8 +30,8 @@ const COMMANDS = ["install", "uninstall", "check", "wait", "deploy", "verify"];
 // candidate installation directories.
 const hooks = {
   replaceFile: (from, to) => fs.renameSync(from, to),
-  spawnWaiter: archive => startWaiter(archive),
-  installRoots: platform => installRootsFor(platform),
+  spawnWaiter: startWaiter,
+  installRoots: installRootsFor,
 };
 
 function setRuntime(dir) { RUNTIME = path.resolve(dir); }
@@ -51,7 +45,7 @@ function sleepSync(ms) {
 }
 
 function readAt(fd, position, length) {
-  const buffer = Buffer.alloc(length);
+  const buffer = Buffer.allocUnsafe(length); // only the filled prefix is returned
   let total = 0;
   while (total < length) {
     const read = fs.readSync(fd, buffer, total, length - total, position + total);
@@ -113,10 +107,6 @@ function fileSha(target) {
   return hash.digest("hex");
 }
 
-function asset(name) {
-  return path.join(SRC, name);
-}
-
 function deploy() {
   // Sync the bundled files into the runtime directory; return what changed.
   if (path.resolve(SRC) === path.resolve(RUNTIME)) return [];
@@ -124,14 +114,7 @@ function deploy() {
   const deployed = [];
   for (const name of RUNTIME_FILES) {
     const source = path.join(SRC, name), target = path.join(RUNTIME, name);
-    const sourceMissing = !fs.existsSync(source) || !fs.statSync(source).isFile();
-    const targetMissing = !fs.existsSync(target) || !fs.statSync(target).isFile();
-    if (sourceMissing) {
-      if (targetMissing && ESSENTIAL_FILES.includes(name))
-        throw new Error(`${name} is missing from both ${SRC} and ${RUNTIME}`);
-      continue; // the runtime copy may legitimately carry files this bundle lacks
-    }
-    if (targetMissing || !fs.readFileSync(target).equals(fs.readFileSync(source))) {
+    if (!fs.existsSync(target) || !fs.readFileSync(target).equals(fs.readFileSync(source))) {
       fs.copyFileSync(source, target);
       deployed.push(name);
     }
@@ -166,13 +149,8 @@ function registryInstallRoots() {
   const key = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
   for (const hive of ["HKCU", "HKLM"]) {
     for (const view of ["/reg:32", "/reg:64"]) {
-      let result;
-      try {
-        result = spawnSync("reg.exe", ["query", `${hive}\\${key}`, "/s", view],
-          { encoding: "utf8", windowsHide: true });
-      } catch (_) {
-        continue;
-      }
+      const result = spawnSync("reg.exe", ["query", `${hive}\\${key}`, "/s", view],
+        { encoding: "utf8", windowsHide: true });
       if (result.status !== 0 || !result.stdout) continue;
       roots.push(...parseRegistryExport(result.stdout));
     }
@@ -182,7 +160,7 @@ function registryInstallRoots() {
 
 function installRootsFor(platform) {
   if (platform === "win32") {
-    const roots = [...registryInstallRoots()];
+    const roots = registryInstallRoots();
     if (process.env.LOCALAPPDATA) roots.push(path.join(process.env.LOCALAPPDATA, "Programs", "ZCode"));
     roots.push(path.join(os.homedir(), "AppData", "Local", "Programs", "ZCode"));
     for (const directory of [process.env.ProgramFiles, process.env["ProgramFiles(x86)"]]) {
@@ -222,14 +200,9 @@ function looksLikeZCodeRoot(root, platform) {
 }
 
 function findZcodeAsar(platform = process.platform) {
-  // Auto-locate app.asar: per-platform discovery roots, deduplicated.
   const tried = [], seen = new Set(), found = [];
-  for (let root of hooks.installRoots(platform)) {
-    try {
-      root = path.resolve(root);
-    } catch (_) {
-      continue;
-    }
+  for (const listed of hooks.installRoots(platform)) {
+    const root = path.resolve(listed);
     const key = root.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
@@ -257,19 +230,10 @@ function saveStatus(fields) {
   fs.writeFileSync(path.join(RUNTIME, "install-status.json"), JSON.stringify(fields, null, 2));
 }
 
-function purgeRuntime(keepBackups) {
-  // Retain backups if pending metadata requests them for manual rollback.
+function purgeRuntime() {
   if (!fs.existsSync(RUNTIME)) return "already absent";
   if (path.resolve(SRC) === path.resolve(RUNTIME))
     return "kept: this script runs inside it; delete the directory manually";
-  if (keepBackups) {
-    for (const child of fs.readdirSync(RUNTIME)) {
-      if (child === "backups") continue;
-      const childPath = path.join(RUNTIME, child);
-      fs.rmSync(childPath, { recursive: true, force: true });
-    }
-    return "cleared; backups/ kept for manual rollback (unverified strip)";
-  }
   fs.rmSync(RUNTIME, { recursive: true, force: true });
   return fs.existsSync(RUNTIME) ? `not fully deleted; delete ${RUNTIME} manually` : "purged";
 }
@@ -277,6 +241,10 @@ function purgeRuntime(keepBackups) {
 function pendingPaths(archive) {
   // The metadata and staged file that make up an unfinished replacement.
   return [path.join(RUNTIME, "pending-install.json"), archive + ".zspeed.pending"];
+}
+
+function hasPending(archive) {
+  return pendingPaths(archive).some(target => fs.existsSync(target));
 }
 
 const ORIGINAL_STAMP_RE = /"originalStamp"\s*:\s*\[([^\]]*)\]/;
@@ -313,13 +281,13 @@ function serializeJsonWithStamp(meta) {
 
 function discardPending(archive) {
   // install/uninstall take over any unfinished replacement (the last command
-  // wins), then plan from app.asar as it is now: the staged file was never
-  // applied, so dropping it leaves app.asar exactly as the plan will read it. Metadata goes first so a still-running waiter exits quietly
-  // (see waitForUnlock) instead of recording "cancelled" over our result.
+  // wins). The staged file was never applied, so app.asar is what the plan reads.
+  // Metadata goes first so a still-running waiter exits quietly instead of
+  // recording "cancelled" over our result (see waitForUnlock).
+  if (!hasPending(archive)) return null;
   const [metaPath, pending] = pendingPaths(archive);
-  if (!fs.existsSync(metaPath) && !fs.existsSync(pending)) return null;
   let intent = "unknown";
-  try { intent = parseMeta(fs.readFileSync(metaPath, "utf8")).intent || "install"; } catch {}
+  try { intent = parseMeta(fs.readFileSync(metaPath, "utf8")).intent; } catch {}
   fs.rmSync(metaPath, { force: true });
   fs.rmSync(pending, { force: true });
   return intent;
@@ -327,8 +295,7 @@ function discardPending(archive) {
 
 function ensureNoPending(archive) {
   // Only deploy refuses; install and uninstall take an unfinished job over.
-  const [metaPath, pending] = pendingPaths(archive);
-  if (!fs.existsSync(metaPath) && !fs.existsSync(pending)) return;
+  if (!hasPending(archive)) return;
   throw new Error("A previous install or uninstall has not finished. Run \"install\" or " +
     "\"uninstall\" to take it over, or fully exit ZCode and wait for it to finish.");
 }
@@ -336,7 +303,7 @@ function ensureNoPending(archive) {
 function waitForUnlock(archive) {
   // Finish this specific, verified repair when the running app releases ASAR.
   archive = path.resolve(archive);
-  const [metaPath] = pendingPaths(archive);
+  const [metaPath, expectedPending] = pendingPaths(archive);
   const metaText = fs.readFileSync(metaPath, "utf8");
   const meta = parseMeta(metaText);
   const pending = meta.pending;
@@ -345,10 +312,9 @@ function waitForUnlock(archive) {
     try { return fs.readFileSync(metaPath, "utf8") !== metaText; } catch { return true; }
   };
   if (path.resolve(meta.asar) !== archive || path.resolve(meta.runtime) !== path.resolve(RUNTIME) ||
-      path.dirname(pending) !== path.dirname(archive) ||
-      path.basename(pending) !== path.basename(archive) + ".zspeed.pending")
+      path.resolve(pending) !== expectedPending)
     throw new Error("Pending repair does not belong to this installation");
-  const final = FINAL_STATE[meta.intent || "install"];
+  const final = FINAL_STATE[meta.intent];
   const pendingStamp = stamp(pending);
   if (fileSha(pending) !== meta.sha256) throw new Error("Pending repair integrity mismatch");
   const deadline = Date.now() + 24 * 3600 * 1000;
@@ -378,8 +344,7 @@ function waitForUnlock(archive) {
     saveStatus({ state: final, version: meta.version, verifiedFiles: meta.verifiedFiles,
       backup: meta.backup, restartRequired: true });
     fs.rmSync(metaPath, { force: true });
-    const purge = meta.purge;
-    if (purge && meta.intent === "uninstall") purgeRuntime(purge.keepBackups);
+    if (meta.intent === "uninstall") purgeRuntime();
     return 0;
   }
   saveStatus({ state: "waiting-expired", reason: "ZCode did not release the file within 24 hours" });
@@ -467,19 +432,18 @@ function readVersion(fd, nodes, base) {
 }
 
 function rendererAssets(nodes) {
-  // Renderer bundle assets, largest first.
   return Object.keys(nodes)
     .filter(name => name.startsWith("out/renderer/assets/") && name.endsWith(".js"))
     .sort((a, b) => Number(nodes[b].size) - Number(nodes[a].size));
 }
 
-function contextSnippets(data, radius = 100) {
+function contextSnippets(text) {
   // Excerpts around each feature string to help locate where the shape moved.
   const snippets = {};
   for (const feature of FEATURES) {
-    const index = data.indexOf(feature);
+    const index = text.indexOf(feature);
     if (index >= 0)
-      snippets[feature] = Buffer.from(String(data).slice(Math.max(0, index - radius), index + radius), "latin1").toString("utf8");
+      snippets[feature] = Buffer.from(text.slice(Math.max(0, index - 100), index + 100), "latin1").toString("utf8");
   }
   return snippets;
 }
@@ -490,13 +454,23 @@ function stripBridge(text) {
 
 function bridgeFor(registry) {
   // Substitute the registry selected by structural detection.
-  return fs.readFileSync(asset("speed-bridge.js")).toString("latin1")
+  return fs.readFileSync(path.join(SRC, "speed-bridge.js")).toString("latin1")
     .replaceAll("__ZSPEED_REGISTRY__", () => registry);
 }
 
 function escapeIdent(name) {
   if (!/^[A-Za-z_$][\w$]*$/.test(name)) throw new Error(`Not an identifier: ${JSON.stringify(name)}`);
   return name.replace(/\$/g, "\\$");
+}
+
+function registryLifecycleFailure(text, registry) {
+  // The Map and delete/stale lifecycle the bridge relies on; null when both exist.
+  const esc = escapeIdent(registry);
+  if (!new RegExp("(?:^|[^\\w$])" + esc + "=new Map\\b").test(text))
+    return `\`${registry}\` has no \`=new Map\` declaration`;
+  if (!new RegExp("(?:^|[^\\w$])" + esc + "\\.delete\\([A-Za-z_$][\\w$]*\\),[A-Za-z_$][\\w$]*\\.stale=!0").test(text))
+    return `\`${registry}\` has no \`delete(...),x.stale=!0\` lifecycle`;
+  return null;
 }
 
 function findObjectClose(text, from, limit) {
@@ -545,7 +519,7 @@ function findObjectOpen(text, from, limit) {
 // order and minified identifier names are free to change between releases.
 function validateAnchorSite(text, index, layerClass, failures) {
   const fail = reason => {
-    if (failures && !failures.reason) failures.reason = reason;
+    if (!failures.reason) failures.reason = reason;
     return null;
   };
   const close = findObjectClose(text, index, 600);
@@ -567,13 +541,11 @@ function validateAnchorSite(text, index, layerClass, failures) {
     if (inline) registry = inline[1];
   }
   if (!registry) return fail("the entry object is not stored via `R.set(`");
-  const esc = escapeIdent(registry);
-  if (!new RegExp("(?:^|[^\\w$])" + esc + "=new Map\\b").test(text))
-    return fail(`\`${registry}\` has no \`=new Map\` declaration`);
-  if (!new RegExp("(?:^|[^\\w$])" + esc + "\\.delete\\([A-Za-z_$][\\w$]*\\),[A-Za-z_$][\\w$]*\\.stale=!0").test(text))
-    return fail(`\`${registry}\` has no \`delete(...),x.stale=!0\` lifecycle`);
-  const classDecl = new RegExp("(?:^|[^\\w$])(?:" + escapeIdent(layerClass) +
-    "\\s*=\\s*class[\\s{(;]|class\\s+" + escapeIdent(layerClass) + "(?![\\w$]))").exec(text);
+  const lifecycle = registryLifecycleFailure(text, registry);
+  if (lifecycle) return fail(lifecycle);
+  const cls = escapeIdent(layerClass);
+  const classDecl = new RegExp("(?:^|[^\\w$])(?:" + cls +
+    "\\s*=\\s*class[\\s{(;]|class\\s+" + cls + "(?![\\w$]))").exec(text);
   if (!classDecl) return fail(`\`${layerClass}\` is not a class declaration`);
   const classBody = text.slice(classDecl.index, classDecl.index + 4000);
   for (const token of ["acquire(", "disposed", "entries", "store:"]) {
@@ -594,7 +566,7 @@ function detectStoreAsset(text) {
   const missing = FEATURES.filter(feature => !text.includes(feature));
   if (missing.length)
     return { stage: "features", missing, snippets: contextSnippets(text) };
-  const failures = { reason: "" };
+  const failures = {};
   const seen = new Set(), candidates = [];
   for (const match of text.matchAll(/layer:new ([A-Za-z_$][\w$]*)\(/g)) {
     const site = validateAnchorSite(text, match.index, match[1], failures);
@@ -612,10 +584,7 @@ function verifyRegistryCandidate(text, registry) {
   // Structural checks for a manually supplied --registry: the same evidence
   // detection would have used, minus the site walk.
   try {
-    const esc = escapeIdent(registry);
-    return new RegExp("(?:^|[^\\w$])" + esc + "=new Map\\b").test(text) &&
-      text.includes("stale:!1}," + registry + ".set(") &&
-      new RegExp("(?:^|[^\\w$])" + esc + "\\.delete\\([A-Za-z_$][\\w$]*\\),[A-Za-z_$][\\w$]*\\.stale=!0").test(text);
+    return text.includes("stale:!1}," + registry + ".set(") && !registryLifecycleFailure(text, registry);
   } catch (_) {
     return false;
   }
@@ -626,11 +595,12 @@ function scanRendererStore(fd, nodes, base) {
   // the same read. Largest assets come first, so the first ready hit wins.
   const scan = { injected: [], ready: [], ambiguous: [], anchorFailed: null, featuresMissing: null };
   for (const name of rendererAssets(nodes)) {
-    const text = readFileNode(fd, nodes, base, name).toString("latin1");
-    if (text.includes(BRIDGE_MARK)) { scan.injected.push(name); continue; }
+    const data = readFileNode(fd, nodes, base, name);
+    const text = data.toString("latin1");
+    if (text.includes(BRIDGE_MARK)) { scan.injected.push({ asset: name, data, text }); continue; }
     const detection = detectStoreAsset(text);
-    if (detection.stage === "ready") scan.ready.push({ asset: name, text, ...detection });
-    else if (detection.stage === "ambiguous") scan.ambiguous.push({ asset: name, text, ...detection });
+    if (detection.stage === "ready") scan.ready.push({ asset: name, data, text, ...detection });
+    else if (detection.stage === "ambiguous") scan.ambiguous.push({ asset: name, data, text, ...detection });
     else if (detection.stage === "anchors" && !scan.anchorFailed)
       scan.anchorFailed = { asset: name, ...detection };
     else if (detection.stage === "features" && !scan.featuresMissing)
@@ -640,8 +610,9 @@ function scanRendererStore(fd, nodes, base) {
   if (scan.ready.length > 1) {
     const registries = new Set(scan.ready.map(entry => entry.registry));
     if (registries.size > 1) {
+      const { asset, data, text } = scan.ready[0];
       scan.ambiguous.unshift({
-        asset: scan.ready[0].asset, text: scan.ready[0].text, stage: "ambiguous",
+        asset, data, text, stage: "ambiguous",
         candidates: scan.ready.map(entry => ({ registry: entry.registry, layerClass: entry.layerClass })),
       });
       scan.ready = [];
@@ -702,9 +673,9 @@ function installPlan(fd, nodes, base, manualRegistry) {
   if (scan.injected.length === 1) {
     // Rebuild from the clean part with the bundled bridge so a bridge source
     // upgrade rewrites the injected copy in place.
-    assetPath = scan.injected[0];
-    oldAsset = readFileNode(fd, nodes, base, assetPath);
-    const text = oldAsset.toString("latin1");
+    const { asset, data, text } = scan.injected[0];
+    assetPath = asset;
+    oldAsset = data;
     let registry = extractInjectedRegistry(text);
     if (registry === null) {
       const detected = detectStoreAsset(stripBridge(text));
@@ -719,10 +690,10 @@ function installPlan(fd, nodes, base, manualRegistry) {
     let entry = scan.ready[0] || null;
     if (!entry && scan.ambiguous.length && manualRegistry &&
         verifyRegistryCandidate(scan.ambiguous[0].text, manualRegistry))
-      entry = { asset: scan.ambiguous[0].asset, text: scan.ambiguous[0].text, registry: manualRegistry };
+      entry = { ...scan.ambiguous[0], registry: manualRegistry };
     if (!entry) throw unsupportedStoreError(scan, manualRegistry);
     assetPath = entry.asset;
-    oldAsset = readFileNode(fd, nodes, base, assetPath);
+    oldAsset = entry.data;
     wantedAsset = entry.text + "\n" + bridgeFor(entry.registry);
     presentBridge = false;
   }
@@ -740,7 +711,7 @@ function uninstallPlan(fd, nodes, base) {
   let assetPath = null, oldAsset = null;
   for (const name of rendererAssets(nodes)) {
     const data = readFileNode(fd, nodes, base, name);
-    if (data.toString("latin1").includes(BRIDGE_MARK)) { assetPath = name; oldAsset = data; break; }
+    if (data.includes(BRIDGE_MARK)) { assetPath = name; oldAsset = data; break; }
   }
   const oldMain = readFileNode(fd, nodes, base, MAIN);
   const oldMainText = oldMain.toString("latin1");
@@ -751,7 +722,7 @@ function uninstallPlan(fd, nodes, base) {
     wanted[assetPath] = Buffer.from(stripBridge(oldAsset.toString("latin1")), "latin1");
   }
   return {
-    assetPath, old, wanted, verified: true,
+    assetPath, old, wanted,
     present: { bridge: assetPath !== null && !old[assetPath].equals(wanted[assetPath]),
       loader: wantedMain !== oldMainText },
   };
@@ -784,6 +755,8 @@ function integrity(data) {
 }
 
 function repack(source, destination, changes) {
+  // Returns the SHA-256 of everything written, so the result is not re-read.
+  const hash = crypto.createHash("sha256");
   const src = fs.openSync(source, "r");
   try {
     const [original, base] = readHeader(src);
@@ -803,28 +776,29 @@ function repack(source, destination, changes) {
     const encoded = Buffer.from(JSON.stringify(header), "utf8");
     const aligned = Math.floor((encoded.length + 4 + 3) / 4) * 4;
     const dst = fs.openSync(destination, "wx");
+    const write = chunk => { fs.writeSync(dst, chunk); hash.update(chunk); };
     try {
       const prefix = Buffer.alloc(16);
       prefix.writeUInt32LE(4, 0);
       prefix.writeUInt32LE(aligned + 4, 4);
       prefix.writeUInt32LE(aligned, 8);
       prefix.writeUInt32LE(encoded.length, 12);
-      fs.writeSync(dst, prefix);
-      fs.writeSync(dst, encoded);
+      write(prefix);
+      write(encoded);
       const padding = aligned - 4 - encoded.length;
-      if (padding > 0) fs.writeSync(dst, Buffer.alloc(padding));
+      if (padding > 0) write(Buffer.alloc(padding));
+      const buffer = Buffer.allocUnsafe(BLOCK);
       for (const [name, node] of Object.entries(newNodes)) {
         if (node.unpacked || "link" in node) continue;
         if (name in changes) {
-          fs.writeSync(dst, changes[name]);
+          write(changes[name]);
         } else {
           let remaining = oldNodes[name].size;
           let position = base + Number(oldNodes[name].offset);
-          const buffer = Buffer.alloc(BLOCK);
           while (remaining > 0) {
             const read = fs.readSync(src, buffer, 0, Math.min(BLOCK, remaining), position);
             if (read <= 0) throw new Error("Truncated ASAR payload");
-            fs.writeSync(dst, buffer.subarray(0, read));
+            write(buffer.subarray(0, read));
             position += read;
             remaining -= read;
           }
@@ -837,6 +811,7 @@ function repack(source, destination, changes) {
   } finally {
     fs.closeSync(src);
   }
+  return hash.digest("hex");
 }
 
 function verifyRepack(source, destination, changes) {
@@ -876,7 +851,7 @@ function verifyRepack(source, destination, changes) {
   }
 }
 
-function apply(archive, intent, version, old, changes, report, purgeAfter, write) {
+function apply(archive, intent, version, old, changes, report, write) {
   // Shared install/uninstall pipeline: backup, repack, verify, replace or pend.
   const originalStamp = stamp(archive);
   const now = new Date();
@@ -901,7 +876,7 @@ function apply(archive, intent, version, old, changes, report, purgeAfter, write
   let keepPending = false;
   let checked;
   try {
-    repack(archive, pending, changes);
+    const pendingSha = repack(archive, pending, changes);
     checked = verifyRepack(archive, pending, changes);
     if (!stampEquals(stamp(archive), originalStamp))
       throw new Error("ZCode updated during repair; current app was left untouched");
@@ -911,8 +886,7 @@ function apply(archive, intent, version, old, changes, report, purgeAfter, write
       if (error.code !== "EPERM" && error.code !== "EBUSY") throw error;
       const metadata = {
         intent, version, asar: archive, runtime: RUNTIME,
-        originalStamp, pending, sha256: fileSha(pending),
-        verifiedFiles: checked, backup, purge: purgeAfter,
+        originalStamp, pending, sha256: pendingSha, verifiedFiles: checked, backup,
       };
       fs.writeFileSync(metaPath, serializeJsonWithStamp(metadata));
       keepPending = true;
@@ -922,13 +896,13 @@ function apply(archive, intent, version, old, changes, report, purgeAfter, write
       const manualContinue = waiterCommandLine(archive, path.join(RUNTIME, "repair-speed.cjs"), "node");
       Object.assign(report, { state: "pending-until-ZCode-exits", intent,
         verifiedFiles: checked, backup, monitorPid: waiter.pid, pending: true,
-        waiter: waiter.mode || "default", manualContinue });
+        waiter: waiter.mode, manualContinue });
       if (waiter.mode === "detached-fallback") {
         report.waiterError = waiter.error;
         report.waiterWarning = "the waiter could not leave the current job tree; if this tool's " +
           "process group is reaped before ZCode exits, run manualContinue yourself";
       }
-      if (purgeAfter !== null && purgeAfter !== undefined)
+      if (intent === "uninstall")
         report.runtimeDir = "deleted automatically once the pending removal completes";
       write(JSON.stringify(report, null, 2) + "\n");
       return 0;
@@ -940,8 +914,7 @@ function apply(archive, intent, version, old, changes, report, purgeAfter, write
     restartRequired: true };
   saveStatus(finalState);
   report.bridge = report.loader = intent === "install";
-  if (purgeAfter !== null && purgeAfter !== undefined)
-    report.runtimeDir = purgeRuntime(purgeAfter.keepBackups);
+  if (intent === "uninstall") report.runtimeDir = purgeRuntime();
   Object.assign(report, finalState);
   write(JSON.stringify(report, null, 2) + "\n");
   return 0;
@@ -958,9 +931,8 @@ function verifyCommand(archive, write) {
     const scan = scanRendererStore(fd, nodes, base);
     if (scan.injected.length) {
       report.stage = "injected";
-      report.injectedAssets = scan.injected;
-      const registry = extractInjectedRegistry(
-        readFileNode(fd, nodes, base, scan.injected[0]).toString("latin1"));
+      report.injectedAssets = scan.injected.map(entry => entry.asset);
+      const registry = extractInjectedRegistry(scan.injected[0].text);
       if (registry !== null) report.registry = registry;
       report.ok = true;
     } else if (scan.ready.length) {
@@ -1110,22 +1082,19 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
     const [header, base] = readHeader(fd);
     const nodes = Object.fromEntries(listFiles(header));
     version = readVersion(fd, nodes, base);
-    if (args.command !== "check") {
-      // Only deploy can still meet a pending job here; install/uninstall discarded it above.
+    if (args.command === "deploy") {
       ensureNoPending(archive);
-      if (args.command === "deploy") {
-        write(JSON.stringify({ version, asar: archive, source: SRC, runtime: RUNTIME,
-          deployed: deploy() }, null, 2) + "\n");
-        return 0;
-      }
-      deployed = deploy();
+      write(JSON.stringify({ version, asar: archive, source: SRC, runtime: RUNTIME,
+        deployed: deploy() }, null, 2) + "\n");
+      return 0;
     }
+    if (args.command !== "check") deployed = deploy();
     if (args.command === "uninstall") plan = uninstallPlan(fd, nodes, base);
     else plan = installPlan(fd, nodes, base, args.registry);
   } finally {
     fs.closeSync(fd);
   }
-  const { old, wanted, present, verified = true } = plan;
+  const { old, wanted, present } = plan;
   const wantedBytes = Object.fromEntries(Object.entries(wanted).map(([name, data]) =>
     [name, Buffer.isBuffer(data) ? data : Buffer.from(data, "latin1")]));
   const changes = Object.fromEntries(Object.keys(wanted)
@@ -1137,12 +1106,11 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
   report.bridge = present.bridge;
   report.loader = present.loader;
   if (Object.keys(changes).length) { // bytes that are never written skip the child-process check
-    syntaxCheck({ ...wantedBytes, "inject-main.cjs": fs.readFileSync(asset("inject-main.cjs")) });
+    syntaxCheck({ ...wantedBytes, "inject-main.cjs": fs.readFileSync(path.join(SRC, "inject-main.cjs")) });
     report.syntax = "ok";
   }
   if (args.command === "check") {
-    const [metaPath, pending] = pendingPaths(archive);
-    report.pending = fs.existsSync(metaPath) || fs.existsSync(pending);
+    report.pending = hasPending(archive);
     write(JSON.stringify(report, null, 2) + "\n");
     return !Object.keys(changes).length && !report.pending ? 0 : 1;
   }
@@ -1151,15 +1119,14 @@ function main(argv = process.argv.slice(2), write = text => process.stdout.write
     if (args.command === "uninstall") {
       saveStatus({ state: "uninstalled", version });
       Object.assign(report, { state: "uninstalled", alreadyClean: true, restartRequired: true,
-        runtimeDir: purgeRuntime(!verified) });
+        runtimeDir: purgeRuntime() });
     } else {
       Object.assign(report, { state: "installed", alreadyInstalled: true, restartRequired: true });
     }
     write(JSON.stringify(report, null, 2) + "\n");
     return 0;
   }
-  const purgeAfter = args.command === "uninstall" ? { keepBackups: !verified } : null;
-  return apply(archive, args.command, version, old, changes, report, purgeAfter, write);
+  return apply(archive, args.command, version, old, changes, report, write);
 }
 
 // runCli is the command-line entry; the rest exist for install.test.cjs.

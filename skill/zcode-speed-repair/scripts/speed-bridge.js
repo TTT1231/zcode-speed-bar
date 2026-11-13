@@ -5,6 +5,7 @@
   const registry = __ZSPEED_REGISTRY__;
   const generations = new WeakMap(), counts = new WeakMap(), childLeases = new Map();
   const MAX_CHILD_LEASES = 64;
+  const AGENT_TOOLS = new Set(["Agent", "Task", "subagent"]);
   let nextGeneration = 0;
   function codePoints(text, from = 0) {
     let length = 0;
@@ -39,13 +40,13 @@
   };
   function agentLinks(rows) {
     const calls = rows.filter(row => row.kind === "toolCall" &&
-      ["Agent", "Task", "subagent"].includes(row.toolName) &&
+      AGENT_TOOLS.has(row.toolName) &&
       typeof row.toolCallId === "string" && typeof row.turnId === "string");
     const children = rows.filter(row => row.kind === "subagent" &&
       typeof row.childSessionId === "string" && row.childSessionId && typeof row.turnId === "string");
     const links = calls.map(row => ({ rowId: row.rowId, toolCallId: row.toolCallId }));
     const claimed = new Set();
-    // Exact parent-ID matching needs no tool name: the host writes parentToolCallId itself.
+    // Exact match first: the host writes parentToolCallId itself.
     for (let i = 0; i < calls.length; i++) {
       const call = calls[i];
       const sameCall = calls.filter(row => row.turnId === call.turnId && row.toolCallId === call.toolCallId);
@@ -58,11 +59,9 @@
       }
     }
     // Match ZCode's unambiguous single-agent fallback when no parent ID was supplied.
-    // The heuristic guesses, so it stays restricted to the tools known to spawn agents.
     for (let i = 0; i < calls.length; i++) {
       const call = calls[i];
       if (links[i].childSessionId) continue;
-      if (!["Agent", "Task", "subagent"].includes(call.toolName)) continue;
       const unlinked = calls.filter((row, index) => row.turnId === call.turnId && !links[index].childSessionId);
       const orphan = sole(children, row => row.turnId === call.turnId && !row.parentToolCallId && !claimed.has(row));
       const conflicting = children.some(row => row.turnId === call.turnId && row.parentToolCallId === call.toolCallId);
@@ -75,10 +74,11 @@
     }
     return links;
   }
+  function release(lease) {
+    try { lease.release(); } catch (_) { /* The host may already have disposed its layer. */ }
+  }
   function releaseChildren() {
-    for (const children of childLeases.values()) for (const lease of children.values()) {
-      try { lease.release(); } catch (_) { /* The host may already have disposed its layer. */ }
-    }
+    for (const children of childLeases.values()) for (const lease of children.values()) release(lease);
     childLeases.clear();
   }
   function syncChildren(stores) {
@@ -109,7 +109,7 @@
     }
     for (const [layer, children] of childLeases) {
       for (const [sid, lease] of children) if (!selected.get(layer)?.has(sid)) {
-        try { lease.release(); } catch (_) { /* The layer can close independently. */ }
+        release(lease);
         children.delete(sid);
       }
       if (!children.size) childLeases.delete(layer);
@@ -152,15 +152,15 @@
       }
       stores.set(sid, store);
       if (!generations.has(store)) generations.set(store, ++nextGeneration);
+      const rows = snapshot.rows.window;
       found.set(sid, {
         sessionId: snapshot.sessionId, epoch: snapshot.logEpoch, seq: snapshot.seq,
         generation: generations.get(store), phase: snapshot.control?.phase,
         connectionGeneration: store.generation, status: state.status, projectionReady: state.projectionReady,
-        agents, tools: snapshot.rows.window.filter(row => row.kind === "toolCall" &&
-          !["Agent", "Task", "subagent"].includes(row.toolName) &&
+        agents, tools: rows.filter(row => row.kind === "toolCall" && !AGENT_TOOLS.has(row.toolName) &&
           typeof row.toolCallId === "string").map(row => ({
           rowId: row.rowId, toolCallId: row.toolCallId, status: row.status
-        })), rows: snapshot.rows.window.map(row => ({
+        })), rows: rows.map(row => ({
           id: row.rowId, turnId: row.productTurnId || row.turnId, kind: row.kind,
           chars: characters(row), state: row.state,
           status: row.kind === "toolCall" ? row.status : undefined,

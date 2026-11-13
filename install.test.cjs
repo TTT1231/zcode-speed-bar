@@ -153,15 +153,14 @@ function startPending(f, command) {
   const mod = loadScript(f.skill);
   mod.setRuntime(f.runtime);
   let output = "";
+  const replaceFile = mod.hooks.replaceFile;
   mod.hooks.replaceFile = () => {
     throw Object.assign(new Error("simulated lock"), { code: "EPERM" });
   };
   mod.hooks.spawnWaiter = () => ({ pid: 1234, mode: "test" });
   const code = mod.main([command, "--asar", f.archive], text => { output += text; });
   assert.strictEqual(code, 0, output);
-  return [mod, JSON.parse(output), () => {
-    mod.hooks.replaceFile = (from, to) => fs.renameSync(from, to);
-  }];
+  return [mod, JSON.parse(output), () => { mod.hooks.replaceFile = replaceFile; }];
 }
 
 test("copied skill installs, checks and uninstalls without the repository", t => {

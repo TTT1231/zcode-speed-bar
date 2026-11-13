@@ -35,21 +35,19 @@ function createSpeedMeter(singleStream = false) {
       while (streams.size > 128) streams.delete(streams.keys().next().value);
       return result;
     }
-    function bySessionId(snapshots) {
+    function sampleAll(snapshots, now) {
       // One snapshot per conversation; a session seen from two stores is unusable.
       const bySession = new Map();
       for (const snapshot of snapshots) {
         if (!snapshot || typeof snapshot.sessionId !== "string" || !Array.isArray(snapshot.rows)) continue;
         bySession.set(snapshot.sessionId, bySession.has(snapshot.sessionId) ? null : snapshot);
       }
+      active.clear();
+      for (const [sid, snapshot] of bySession) if (snapshot) active.set(sid, update(snapshot, now));
       return bySession;
     }
-    function sampleAll(snapshots, now) {
-      active.clear();
-      for (const [sid, snapshot] of bySessionId(snapshots)) if (snapshot) active.set(sid, update(snapshot, now));
-    }
     return {
-      update, sampleAll, bySessionId,
+      update, sampleAll,
       get: sid => active.get(sid) || { sessionId: sid || "", mode: "unavailable", tps: null },
       reset() { streams.clear(); active.clear(); }
     };
@@ -155,9 +153,10 @@ function rendererMain(makeMeter, version) {
   if (typeof window.__ZSPEED_DISPOSE__ === "function") window.__ZSPEED_DISPOSE__();
   window.__ZSPEED_VERSION__ = version;
   const meter = makeMeter();
-  const bars = new Map(), agentBars = new Map(), toolTimes = new Map();
+  const bars = new Map(), badges = new Map(), toolTimes = new Map();
   let lastPane = null;
   const offsets = new Map(); // memory-only: positions are never persisted
+  const clamp = (x, limit) => limit === null ? x : Math.max(-limit, Math.min(limit, x));
   function offsetLimit(bar, pane) {
     try {
       const paneWidth = pane.getBoundingClientRect().width;
@@ -173,9 +172,8 @@ function rendererMain(makeMeter, version) {
   function applyOffset(bar, pane) {
     const raw = offsets.get(roleOf(pane)) || 0;
     // A zero offset is always inside the limit; skip the layout reads.
-    const limit = raw === 0 ? 0 : offsetLimit(bar, pane);
-    const x = limit === null ? raw : Math.max(-limit, Math.min(limit, raw));
-    bar.style.transform = "translateX(calc(-50% + " + x + "px))";
+    const transform = "translateX(calc(-50% + " + clamp(raw, raw === 0 ? 0 : offsetLimit(bar, pane)) + "px))";
+    if (bar.style.transform !== transform) bar.style.transform = transform;
   }
   function attachDrag(bar, pane) {
     bar.addEventListener("pointerdown", event => {
@@ -187,9 +185,7 @@ function rendererMain(makeMeter, version) {
       try { bar.setPointerCapture(event.pointerId); } catch (_) {}
       const move = e => {
         e.stopPropagation();
-        const limit = offsetLimit(bar, pane);
-        const next = startOffset + (e.clientX - startX);
-        offsets.set(role, limit === null ? next : Math.max(-limit, Math.min(limit, next)));
+        offsets.set(role, clamp(startOffset + (e.clientX - startX), offsetLimit(bar, pane)));
         applyOffset(bar, pane);
       };
       const finish = e => {
@@ -289,14 +285,15 @@ function rendererMain(makeMeter, version) {
   function speedInfo(result, agent = false) {
     const tps = Number.isFinite(result.tps) && result.tps >= 0 ? result.tps : null;
     const label = tps === null ? "—" : tps.toFixed(1);
-    return { tps, label,
-      band: tps === null || (agent && (tps === 0 || result.mode === "waiting")) ? "idle" : agent
-        ? tps > 100 ? "fast" : tps >= 70 ? "medium" : tps >= 40 ? "slow" : "very-slow"
-        : tps === 0 ? "idle" : tps >= 70 ? "fast" : tps >= 40 ? "medium" : "slow",
+    let band;
+    if (tps === null || tps === 0 || (agent && result.mode === "waiting")) band = "idle";
+    else if (agent) band = tps > 100 ? "fast" : tps >= 70 ? "medium" : tps >= 40 ? "slow" : "very-slow";
+    else band = tps >= 70 ? "fast" : tps >= 40 ? "medium" : "slow";
+    return { tps, label, band,
       aria: tps === null ? "正在采样生成速度" : (result.est ? "生成速度约 " : "生成速度 ") + label + " token/s" };
   }
-  function ensureAgent(summary) {
-    const old = agentBars.get(summary);
+  function ensureBadge(summary) {
+    const old = badges.get(summary);
     if (old && old.isConnected && old.parentElement === summary) return old;
     if (old) old.remove();
     const badge = document.createElement("span");
@@ -306,8 +303,33 @@ function rendererMain(makeMeter, version) {
     badge.style.cssText = "display:inline-block;flex:none;white-space:nowrap;pointer-events:none;user-select:none;"
       + "font:600 .9em/1.4 var(--font-mono,ui-monospace,Consolas,monospace);font-variant-numeric:tabular-nums;";
     summary.appendChild(badge);
-    agentBars.set(summary, badge);
+    badges.set(summary, badge);
     return badge;
+  }
+  function forEachBlock(pane, byRow, fn) {
+    // Calls fn(item, block) for each tool block in this pane matched by row and tool-call id.
+    if (!byRow.size) return;
+    for (const block of pane.querySelectorAll('[data-tool-call-id][data-tool-name]')) {
+      if (paneOf(block) !== pane) continue;
+      const row = block.closest('[data-row-id]');
+      const item = row && byRow.get(row.getAttribute("data-row-id") + "|" + block.getAttribute("data-tool-call-id"));
+      if (item) fn(item, block);
+    }
+  }
+  function paintBadge(block, selector, seen, theme, band, text, aria) {
+    const summary = Array.from(block.querySelectorAll(selector))
+      .find(element => element.closest('[data-tool-call-id]') === block);
+    if (!summary) return;
+    seen.add(summary);
+    const badge = ensureBadge(summary);
+    // Band colors come from the shared stylesheet; skip writes while unchanged.
+    const signature = [theme, band, text, aria].join(":");
+    if (badge.__zspeed === signature) return;
+    badge.__zspeed = signature;
+    badge.textContent = text;
+    badge.setAttribute("data-speed-band", band);
+    badge.setAttribute("data-zspeed-theme", theme);
+    badge.setAttribute("aria-label", aria);
   }
   function showAgents(pane, snapshot, theme, seen) {
     if (!snapshot || !Array.isArray(snapshot.agents)) return;
@@ -317,37 +339,16 @@ function rendererMain(makeMeter, version) {
       const key = agent.rowId + "|" + agent.toolCallId;
       byRow.set(key, byRow.has(key) ? null : agent);
     }
-    if (!byRow.size) return;  // Without agents even scanning tool blocks is wasted work.
-    for (const block of pane.querySelectorAll('[data-tool-call-id][data-tool-name]')) {
-      if (paneOf(block) !== pane) continue;
-      const row = block.closest('[data-row-id]');
-      const agent = row && byRow.get(row.getAttribute("data-row-id") + "|" + block.getAttribute("data-tool-call-id"));
-      if (!agent) continue;
-      const summary = Array.from(block.querySelectorAll('[data-testid^="tool-summary-trigger-"], [data-testid^="v4-subagent-open-side-pane-"]'))
-        .find(element => element.closest('[data-tool-call-id]') === block);
-      if (!summary) continue;
-      seen.add(summary);
-      const badge = ensureAgent(summary);
-      const result = ready ? meter.get(agent.childSessionId) : { tps: null };
-      const info = speedInfo(result, true);
-      // Band colors come from the shared stylesheet; skip writes while unchanged.
-      const signature = [theme, info.band, info.label, result.est].join(":");
-      if (badge.__zspeed === signature) continue;
-      badge.__zspeed = signature;
-      badge.textContent = info.label + " t/s";
-      badge.setAttribute("data-speed-band", info.band);
-      badge.setAttribute("data-zspeed-theme", theme);
-      badge.setAttribute("aria-label", info.aria);
-    }
+    forEachBlock(pane, byRow, (agent, block) => {
+      const info = speedInfo(ready ? meter.get(agent.childSessionId) : { tps: null }, true);
+      paintBadge(block, '[data-testid^="tool-summary-trigger-"], [data-testid^="v4-subagent-open-side-pane-"]',
+        seen, theme, info.band, info.label + " t/s", info.aria);
+    });
   }
   function showTools(pane, snapshot, now, theme, seen) {
     if (!snapshot || !Array.isArray(snapshot.tools)) return;
     const byRow = new Map(snapshot.tools.map(tool => [tool.rowId + "|" + tool.toolCallId, tool]));
-    for (const block of pane.querySelectorAll('[data-tool-call-id][data-tool-name]')) {
-      if (paneOf(block) !== pane) continue;
-      const row = block.closest('[data-row-id]');
-      const tool = row && byRow.get(row.getAttribute("data-row-id") + "|" + block.getAttribute("data-tool-call-id"));
-      if (!tool) continue;
+    forEachBlock(pane, byRow, (tool, block) => {
       const key = JSON.stringify([snapshot.sessionId, tool.rowId, tool.toolCallId]);
       let timing = toolTimes.get(key);
       if (!timing && tool.status === "running") {
@@ -355,25 +356,15 @@ function rendererMain(makeMeter, version) {
         toolTimes.set(key, timing);
         if (toolTimes.size > 1024) toolTimes.delete(toolTimes.keys().next().value);
       }
-      if (!timing) continue;
+      if (!timing) return;
       if (timing.running) timing.elapsed = Math.max(0, now - timing.start);
       timing.running = tool.status === "running";
-      const summary = Array.from(block.querySelectorAll('[data-testid^="tool-summary-trigger-"]'))
-        .find(element => element.closest('[data-tool-call-id]') === block);
-      if (!summary) continue;
-      seen.add(summary);
-      const badge = ensureAgent(summary);
       const seconds = timing.elapsed / 1000;
       const label = Math.max(0.1, seconds).toFixed(1);
       const band = seconds <= 1 ? "fast" : seconds <= 3 ? "medium" : seconds <= 5 ? "slow" : "very-slow";
-      const signature = ["tool", theme, band, label].join(":");
-      if (badge.__zspeed === signature) continue;
-      badge.__zspeed = signature;
-      badge.textContent = label + " s";
-      badge.setAttribute("data-speed-band", band);
-      badge.setAttribute("data-zspeed-theme", theme);
-      badge.setAttribute("aria-label", "工具观察耗时约 " + label + " 秒");
-    }
+      paintBadge(block, '[data-testid^="tool-summary-trigger-"]', seen, theme, band,
+        label + " s", "工具观察耗时约 " + label + " 秒");
+    });
   }
   function tick() {
     const panes = Array.from(document.querySelectorAll(PANE_SELECTOR)).filter(visible);
@@ -381,34 +372,34 @@ function rendererMain(makeMeter, version) {
     const sid = pane && pane.getAttribute("data-session-id");
     const hasBridge = typeof window.__ZSPEED_READ_ALL__ === "function";
     const snapshots = hasBridge ? window.__ZSPEED_READ_ALL__() : [];
-    meter.sampleAll(snapshots, performance.now());
-    const bySession = meter.bySessionId(snapshots);
+    const now = performance.now();
+    const bySession = meter.sampleAll(snapshots, now);
     const paneSet = new Set(panes);
     for (const [pane, entry] of bars) {
       if (!paneSet.has(pane)) { entry.bar.remove(); bars.delete(pane); }
     }
     const theme = document.documentElement.classList.contains("dark") ? "dark" : "light";
-    const seenAgents = new Set();
-    const now = performance.now();
+    const seen = new Set();
     for (const pane of panes) {
-      const result = meter.get(pane.getAttribute("data-session-id"));
+      const paneSid = pane.getAttribute("data-session-id");
+      const result = meter.get(paneSid);
       const entry = ensure(pane), { bar, value } = entry;
       applyOffset(bar, pane);
-      bar.setAttribute("data-zspeed-theme", theme);
       const info = speedInfo(result);
-      const next = info.label + ":" + result.mode;
+      const next = [info.label, result.mode, theme].join(":");
       if (next !== entry.signature) {
         entry.signature = next;
         value.textContent = info.label;
+        bar.setAttribute("data-zspeed-theme", theme);
         bar.setAttribute("data-speed-band", info.band);
         bar.setAttribute("aria-label", info.aria);
       }
-      const snapshot = bySession.get(pane.getAttribute("data-session-id"));
-      showAgents(pane, snapshot, theme, seenAgents);
-      showTools(pane, snapshot, now, theme, seenAgents);
+      const snapshot = bySession.get(paneSid);
+      showAgents(pane, snapshot, theme, seen);
+      showTools(pane, snapshot, now, theme, seen);
     }
-    for (const [summary, badge] of agentBars) if (!seenAgents.has(summary)) {
-      badge.remove(); agentBars.delete(summary);
+    for (const [summary, badge] of badges) if (!seen.has(summary)) {
+      badge.remove(); badges.delete(summary);
     }
     // Report the selected conversation in diagnostic status.
     return { ...meter.get(sid), bridge: hasBridge, tickAt: Date.now() };
@@ -420,9 +411,9 @@ function rendererMain(makeMeter, version) {
     document.removeEventListener("pointerdown", rememberPane, true);
     document.removeEventListener("focusin", rememberPane, true);
     for (const entry of bars.values()) entry.bar.remove();
-    for (const badge of agentBars.values()) badge.remove();
+    for (const badge of badges.values()) badge.remove();
     bars.clear();
-    agentBars.clear();
+    badges.clear();
     toolTimes.clear();
     lastPane = null;
     meter.reset();
@@ -460,8 +451,10 @@ function install() {
   }
   function injectable(wc) {
     try {
-      if (wc.isDestroyed() || wc.getType() !== "window" || !wc.getURL().startsWith("file:")) return false;
-      const relative = path.relative(process.resourcesPath, fileURLToPath(wc.getURL()));
+      if (wc.isDestroyed() || wc.getType() !== "window") return false;
+      const url = wc.getURL();
+      if (!url.startsWith("file:")) return false;
+      const relative = path.relative(process.resourcesPath, fileURLToPath(url));
       return relative !== ".." && !relative.startsWith(".." + path.sep) && !path.isAbsolute(relative);
     } catch (_) { return false; }
   }
